@@ -245,7 +245,7 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 			//log.Println(string(data))
 			switch typeDoc := ev.(*network.EventResponseReceived).Type; typeDoc {
 			case "XHR":
-				analyseStruct.XHRUrl = append(analyseStruct.XHRUrl, ev.(*network.EventResponseReceived).Response.URL)
+				analyseStruct.AddXHRUrl(ev.(*network.EventResponseReceived).Response.URL)
 			case "Stylesheet":
 				//analyseStruct.CSSContent = append(analyseStruct.CSSContent,ev.(*network.EventResponseReceived).Response.URL)
 

@@ -3,6 +3,7 @@ package analyze
 import (
 	"context"
 	"strings"
+	"sync"
 	"github.com/EasyRecon/wappaGo/lib"
 	structure "github.com/EasyRecon/wappaGo/structure"
 	"github.com/PuerkitoBio/goquery"
@@ -27,6 +28,7 @@ type Analyze struct {
 	CertIssuer		string
 	CSSContent		[]string
 	XHRUrl   		[]string
+	xhrMu    		sync.Mutex // guards XHRUrl (written from the CDP listener goroutine)
 }
 
 
