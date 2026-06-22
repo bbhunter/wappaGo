@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -385,18 +386,20 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 
 	data.Infos.Technologies = technologies.DedupTechno(data.Infos.Technologies)
 	if *c.Options.Screenshot != "" && len(buf) > 0 {
-		imgTitle := strings.Replace(urlData, ":", "_", -1)
-		imgTitle = strings.Replace(imgTitle, "/", "", -1)
-		imgTitle = strings.Replace(imgTitle, ".", "_", -1)
-		//fmt.Println(screen + "/" + imgTitle + ".png")
-		file, _ := os.OpenFile(
+		// Name the screenshot by the SHA-1 of its URL. The previous scheme
+		// stripped ':' '/' '.' from the URL, which collapsed distinct URLs to
+		// the same filename and silently overwrote screenshots.
+		imgTitle := fmt.Sprintf("%x", sha1.Sum([]byte(urlData)))
+		file, err := os.OpenFile(
 			*c.Options.Screenshot+"/"+imgTitle+".png",
 			os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
 			0666,
 		)
-		file.Write(buf)
-		file.Close()
-		data.Infos.Screenshot = imgTitle + ".png"
+		if err == nil {
+			file.Write(buf)
+			file.Close()
+			data.Infos.Screenshot = imgTitle + ".png"
+		}
 	}
 	if *c.Options.Report {
 		c.reportMu.Lock()
