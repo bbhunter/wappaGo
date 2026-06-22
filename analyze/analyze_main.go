@@ -88,10 +88,13 @@ func (a *Analyze) Run() []structure.Technologie {
 
 
 func (a *Analyze) NewTechno(name string)(structure.Technologie){
-	technoTemp := structure.Technologie{}
-	technoTemp.Name = name
-	if a.ResultGlobal[name].(map[string]interface{})["cpe"] != nil {
-		technoTemp.Cpe = a.ResultGlobal[name].(map[string]interface{})["cpe"].(string)
+	technoTemp := structure.Technologie{Name: name}
+	// The fingerprint may be absent (e.g. an implied techno missing from the
+	// DB) or carry a non-string cpe; both are tolerated rather than panicking.
+	if entry, ok := a.ResultGlobal[name].(map[string]interface{}); ok {
+		if cpe, ok := entry["cpe"].(string); ok {
+			technoTemp.Cpe = cpe
+		}
 	}
 	return technoTemp
 }

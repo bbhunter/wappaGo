@@ -89,17 +89,39 @@ func (c *Cmd) Start(results chan structure.Data) {
 	url = ""
 	ip = ""
 	for _, line := range c.Input {
+		ip = ""
 		if *c.Options.AmassInput {
 			var result map[string]interface{}
-			json.Unmarshal([]byte(line), &result)
-			url = result["name"].(string)
-			ip = result["addresses"].([]interface{})[0].(map[string]interface{})["ip"].(string)
+			if err := json.Unmarshal([]byte(line), &result); err != nil {
+				fmt.Fprintf(os.Stderr, "skip amass line: %v\n", err)
+				continue
+			}
+			name, ok := result["name"].(string)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "skip amass line: missing name\n")
+				continue
+			}
+			url = name
+			// Address is best-effort: a missing/odd shape leaves ip empty
+			// (the host is still scanned by name) instead of panicking.
+			if addrs, ok := result["addresses"].([]interface{}); ok && len(addrs) > 0 {
+				if addr0, ok := addrs[0].(map[string]interface{}); ok {
+					if ipStr, ok := addr0["ip"].(string); ok {
+						ip = ipStr
+					}
+				}
+			}
 		} else {
 			url = line
 		}
 		swg.Add()
 		go func(url string, ip string) {
 			defer swg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "recovered while scanning %s: %v\n", url, r)
+				}
+			}()
 			c.startPortScan(url, ip, results)
 		}(url, ip)
 	}
@@ -164,6 +186,11 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 		swg.Add()
 		go func(port string, url string, portOpen []string, CdnName string, c *Cmd) {
 			defer swg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "recovered while probing %s:%s: %v\n", url, port, r)
+				}
+			}()
 			data := structure.Data{}
 			data.Infos.CDN = CdnName
 			data.Infos.Data = url

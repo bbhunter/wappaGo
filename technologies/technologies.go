@@ -12,9 +12,13 @@ import (
 	"github.com/imdario/mergo"
 )
 func CheckRequired(technoName string, technoList map[string]interface{}, tech []structure.Technologie) []structure.Technologie {
-	for name, _ := range technoList[technoName].(map[string]interface{}) {
+	entry, ok := technoList[technoName].(map[string]interface{})
+	if !ok {
+		return tech
+	}
+	for name, _ := range entry {
 		if name == "requires" {
-			requires := technoList[technoName].(map[string]interface{})["requires"]
+			requires := entry["requires"]
 			// Tentative d'assertion du type directement en string
 			if reqString, ok := requires.(string); ok {
 			    tech = AddTechno(reqString, tech, technoList)
@@ -38,7 +42,7 @@ func CheckRequired(technoName string, technoList map[string]interface{}, tech []
 			}
 		}
 		if name == "implies" {
-			implies := technoList[technoName].(map[string]interface{})["implies"]
+			implies := entry["implies"]
 			switch v := implies.(type) {
 			case string:
 			    // Si c'est une chaîne, on ajoute directement la technologie
@@ -65,10 +69,13 @@ func CheckRequired(technoName string, technoList map[string]interface{}, tech []
 	return tech
 }
 func AddTechno(name string, tech []structure.Technologie, technoList map[string]interface{}) []structure.Technologie {
-	technoTemp := structure.Technologie{}
-	technoTemp.Name = name
-	if _, ok := technoList[name].(map[string]interface{})["cpe"]; ok {
-		technoTemp.Cpe = technoList[name].(map[string]interface{})["cpe"].(string)
+	technoTemp := structure.Technologie{Name: name}
+	// Guard every step: the implied/required techno may be missing from the DB
+	// or carry a nil/non-string cpe (the original code panicked on both).
+	if entry, ok := technoList[name].(map[string]interface{}); ok {
+		if cpe, ok := entry["cpe"].(string); ok {
+			technoTemp.Cpe = cpe
+		}
 	}
 	tech = append(tech, technoTemp)
 	return tech

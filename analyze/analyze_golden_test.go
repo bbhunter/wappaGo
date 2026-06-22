@@ -142,6 +142,29 @@ func TestRunGoldenURLAndDNS(t *testing.T) {
 	}
 }
 
+// TestImpliesMissingTechnoNoPanic pins the crash-containment hardening: an
+// "implies" edge pointing at a technology absent from the DB must add that
+// technology without panicking (the original AddTechno/NewTechno asserted the
+// missing map entry and crashed the whole scan).
+func TestImpliesMissingTechnoNoPanic(t *testing.T) {
+	rg := map[string]interface{}{
+		"Thing": map[string]interface{}{
+			"html":    "thing-marker",
+			"implies": "GhostTech", // intentionally not present in the DB
+		},
+	}
+	a := Analyze{ResultGlobal: rg, Body: `<html><body>thing-marker</body></html>`}
+
+	got := technologies.DedupTechno(a.Run()) // must not panic
+	names := technologyVersions(got)
+	if _, ok := names["Thing"]; !ok {
+		t.Errorf("Thing not detected (got %v)", technologyNames(got))
+	}
+	if _, ok := names["GhostTech"]; !ok {
+		t.Errorf("implied GhostTech not added (got %v)", technologyNames(got))
+	}
+}
+
 // TestCompileCICachesAndToleratesBadPatterns documents the contract the
 // matchers rely on: valid patterns compile (and are cached), invalid RE2
 // patterns return ok=false instead of panicking.
