@@ -47,6 +47,7 @@ type Cmd struct {
 	portMu       sync.Mutex // guards PortOpenByIP
 	HttpClient   *http.Client
 	ResultArray  []structure.Data
+	reportMu     sync.Mutex // guards ResultArray (report mode)
 	Input        []string
 }
 
@@ -139,6 +140,12 @@ func (c *Cmd) Start(results chan structure.Data) {
 		}(url, ip)
 	}
 	swg.Wait()
+	// Render the HTML report exactly once, from the complete result set, after
+	// all targets finish. Previously launchChrome regenerated the whole file
+	// after every host (O(n^2) rewrites with concurrent writers).
+	if *c.Options.Report {
+		report.Report_main(c.ResultArray, *c.Options.Screenshot)
+	}
 	close(results)
 }
 
@@ -392,12 +399,11 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 		data.Infos.Screenshot = imgTitle + ".png"
 	}
 	if *c.Options.Report {
+		c.reportMu.Lock()
 		c.ResultArray = append(c.ResultArray, data)
+		c.reportMu.Unlock()
 	} else {
 		results <- data
-	}
-	if *c.Options.Report {
-		report.Report_main(c.ResultArray, *c.Options.Screenshot)
 	}
 }
 

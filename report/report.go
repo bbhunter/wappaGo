@@ -3,8 +3,9 @@ package report
 
 import(
 	"github.com/EasyRecon/wappaGo/structure"
-"os"
-"strconv"
+	"html/template"
+	"os"
+	"strings"
 )
 
 
@@ -90,45 +91,73 @@ main{
     return a
 }
 
-func card(data structure.Data,screenPath string)(string){
-	var technos string
-	var version string
-	var status string
-	for _,techno := range data.Infos.Technologies {
-		version =""
-		if techno.Version != "" {
-			version=" | "+techno.Version
-		}
-		technos = technos+"<span class=\"badge badge-pill text-break text-wrap badge-info\">"+techno.Name+version+"</span>"
-	}
-	status ="badge-secondary"
-	switch i := data.Infos.Status_code; {
-	    case i<300:
-	        status ="badge-success"
-	    case i>299 && i<400:
-	        status ="badge-info"
-	    case i>399 && i<500:
-	        status ="badge-warning"
-        case i>499:
-        	status ="badge-danger"
-    }
-		return `<div class="card page-card col-2" style="margin:2px;padding:0px">
-            <div title="`+data.Infos.Title+`" class="card-header text-truncate"> `+data.Url+` </div>
+// cardView holds the per-host values rendered into the report. Every field is
+// attacker-controlled (page title, scanned URL, detected technology names),
+// so the card is rendered through html/template, which contextually escapes
+// each value. The previous implementation concatenated these straight into the
+// HTML, allowing a malicious page <title> to inject script into the report.
+type cardView struct {
+	Title         string
+	Url           string
+	ScreenshotSrc string
+	StatusClass   string
+	StatusCode    int
+	Technos       []string
+}
+
+var cardTmpl = template.Must(template.New("card").Parse(`<div class="card page-card col-2" style="margin:2px;padding:0px">
+            <div title="{{.Title}}" class="card-header text-truncate"> {{.Url}} </div>
             <div class="page-screenshot-container">
-              <img src="`+screenPath+`/`+data.Infos.Screenshot+`" alt="`+data.Infos.Title+`" onerror="this.src='https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/1024px-No_image_available.svg.png'" class="card-img page-screenshot" style="transform: scale(1); transform-origin: 11.5772% 95.4698%;">
+              <img src="{{.ScreenshotSrc}}" alt="{{.Title}}" onerror="this.src='https://upload.wikimedia.org/wikipedia/commons/thumb/a/ac/No_image_available.svg/1024px-No_image_available.svg.png'" class="card-img page-screenshot" style="transform: scale(1); transform-origin: 11.5772% 95.4698%;">
             </div>
             <div class="card-body">
-              <h5 class="card-title">`+data.Infos.Title+`</h5>
+              <h5 class="card-title">{{.Title}}</h5>
               <p class="card-text">
-                <span class="badge badge-pill text-break text-wrap `+status+`">Status: `+strconv.Itoa(data.Infos.Status_code)+`</span>
-                `+technos+`
+                <span class="badge badge-pill text-break text-wrap {{.StatusClass}}">Status: {{.StatusCode}}</span>
+                {{range .Technos}}<span class="badge badge-pill text-break text-wrap badge-info">{{.}}</span>{{end}}
               </p>
             </div>
             <div class="card-footer">
-              <a href="`+data.Url+`" target="_blank" class="btn btn-outline-secondary btn-sm card-link float-right">Visit Page</a>
+              <a href="{{.Url}}" target="_blank" class="btn btn-outline-secondary btn-sm card-link float-right">Visit Page</a>
             </div>
-          </div>`
+          </div>`))
 
+func card(data structure.Data, screenPath string) string {
+	status := "badge-secondary"
+	switch i := data.Infos.Status_code; {
+	case i < 300:
+		status = "badge-success"
+	case i > 299 && i < 400:
+		status = "badge-info"
+	case i > 399 && i < 500:
+		status = "badge-warning"
+	case i > 499:
+		status = "badge-danger"
+	}
+
+	var technos []string
+	for _, techno := range data.Infos.Technologies {
+		label := techno.Name
+		if techno.Version != "" {
+			label += " | " + techno.Version
+		}
+		technos = append(technos, label)
+	}
+
+	view := cardView{
+		Title:         data.Infos.Title,
+		Url:           data.Url,
+		ScreenshotSrc: screenPath + "/" + data.Infos.Screenshot,
+		StatusClass:   status,
+		StatusCode:    data.Infos.Status_code,
+		Technos:       technos,
+	}
+
+	var sb strings.Builder
+	if err := cardTmpl.Execute(&sb, view); err != nil {
+		return ""
+	}
+	return sb.String()
 }
 
 
