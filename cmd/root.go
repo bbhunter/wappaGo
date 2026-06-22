@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	URL "net/url"
@@ -141,7 +140,9 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 	isCDN, cdnName, _, err := c.Cdn.Check(net.ParseIP(ip))
 	//fmt.Println(isCDN, ip)
 	if err != nil {
-		log.Fatal(err)
+		// A CDN lookup failure for a single IP must not abort the whole
+		// scan; treat the host as non-CDN and carry on.
+		isCDN = false
 	}
 	//fmt.Println(isCDN)
 	if isCDN {
@@ -253,7 +254,8 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 		data.Infos.Cname = dnsData.CNAME
 	}
 	analyseStruct := analyze.Analyze{}
-	ctxAlloc1, _ := context.WithTimeout(c.ChromeCtx, 60*time.Second)
+	ctxAlloc1, cancelTimeout := context.WithTimeout(c.ChromeCtx, 60*time.Second)
+	defer cancelTimeout()
 	cloneCTX, cancel := chromedp.NewContext(ctxAlloc1)
 	chromedp.ListenTarget(cloneCTX, func(ev interface{}) {
 		if _, ok := ev.(*network.EventResponseReceived); ok {
@@ -315,11 +317,14 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 			body, err := dom.GetOuterHTML().WithNodeID(node.NodeID).Do(ctx)
 			if err == nil {
 				reader := strings.NewReader(body)
-				doc, err := goquery.NewDocumentFromReader(reader)
-	
-				if err != nil {
-					log.Fatal(err)
+				doc, errDoc := goquery.NewDocumentFromReader(reader)
+
+				if errDoc != nil {
+					// Malformed DOM: skip analysis for this target rather
+					// than killing the whole process.
+					return errDoc
 				}
+				analyseStruct.Doc = doc
 				var srcList []string
 				doc.Find("script").Each(func(i int, s *goquery.Selection) {
 					srcLink, exist := s.Attr("src")
@@ -471,7 +476,7 @@ func (c *Cmd) InitDialer() *fastdialer.Dialer {
 
 	dialer, err := fastdialer.NewDialer(fastdialerOpts)
 	if err != nil {
-		fmt.Errorf("could not create resolver cache: %s", err)
+		fmt.Fprintf(os.Stderr, "could not create resolver cache: %s\n", err)
 	}
 	return dialer
 }

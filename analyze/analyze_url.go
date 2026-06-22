@@ -2,7 +2,6 @@ package analyze
 
 import (
 	"fmt"
-	"regexp"
 	"github.com/EasyRecon/wappaGo/technologies"
 )
 
@@ -20,8 +19,8 @@ func (a *Analyze)analyze_url_main(technoName string,key string){
 }
 
 func  (a *Analyze) analyze_url(technoName string,regexStr string){
-	findregex, _ := regexp.MatchString("(?i)"+regexStr, a.Hote.Location)
-	if findregex == true {
+	re, ok := compileCI(regexStr)
+	if ok && re.MatchString(a.Hote.Location) {
 		technoTemp := a.NewTechno(technoName)
 		a.Technos = append(a.Technos, technoTemp)
 		a.Technos = technologies.CheckRequired(technoTemp.Name, a.ResultGlobal, a.Technos)

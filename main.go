@@ -57,7 +57,14 @@ func configure(options structure.Options) {
 	c.Options = options
 	c.Input = input
 
-	results := make(chan structure.Data)
+	// Buffer the results channel so producer goroutines (up to
+	// Threads*ChromeThreads of them) don't serialise on the single stdout
+	// consumer.
+	resultsBuffer := *options.Threads * *options.ChromeThreads
+	if resultsBuffer < 1 {
+		resultsBuffer = 1
+	}
+	results := make(chan structure.Data, resultsBuffer)
 
 	go func() {
 		for result := range results {

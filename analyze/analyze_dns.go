@@ -5,7 +5,6 @@ import(
 
 	"fmt"
 	"github.com/EasyRecon/wappaGo/technologies"
-	"regexp"
 )
 func (a *Analyze) analyze_dns_main(technoName string,key string){
 	for key,value := range a.ResultGlobal[technoName].(map[string]interface{})[key].(map[string]interface{})    {
@@ -43,10 +42,12 @@ func (a *Analyze) analyze_dns_main(technoName string,key string){
 }
 
 func (a *Analyze) analyze_dns_regex(regex string,resultsDNS []string)(bool){
-
+	re, ok := compileCI(regex)
+	if !ok {
+		return false
+	}
 	for _,resultDNS:= range resultsDNS {
-		findregex, _ := regexp.MatchString("(?i)"+regex, resultDNS)
-		if findregex {
+		if re.MatchString(resultDNS) {
 			return true
 		}
 	}

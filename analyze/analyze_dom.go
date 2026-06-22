@@ -3,8 +3,6 @@ package analyze
 
 import (
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 	"github.com/EasyRecon/wappaGo/technologies"
 	"github.com/PuerkitoBio/goquery"
@@ -67,21 +65,11 @@ func  (a *Analyze) analyze_dom_attribute(technoName string,domKeyElement2 string
 	if dommAttr != "" {
 		if domKeyElement2 != "" {
 			regex := strings.Split(domElement2.(string), "\\;")
-			findRegex, _ := regexp.MatchString("(?i)"+regex[0], dommAttr)
-			if findRegex {
+			re, ok := compileCI(regex[0])
+			if ok && re.MatchString(dommAttr) {
 				technoTemp := a.NewTechno(technoName)
-				compiledregex := regexp.MustCompile("(?i)" + regex[0])
-				regexGroup := compiledregex.FindAllStringSubmatch(dommAttr, -1)
-																
-				if len(regex) > 1 && strings.HasPrefix(regex[1], "version") {
-					versionGrp := strings.Split(regex[1], "\\")
-																		
-					if len(versionGrp) > 1 {
-						offset, _ := strconv.Atoi(versionGrp[1])
-																			//fmt.Println(versionGrp)
-						technoTemp.Version = regexGroup[0][offset]
-					}
-				}
+				regexGroup := re.FindAllStringSubmatch(dommAttr, -1)
+				technoTemp.Version = versionFromMarker(regex, regexGroup)
 				a.Technos = append(a.Technos, technoTemp)
 				a.Technos = technologies.CheckRequired(technoTemp.Name, a.ResultGlobal, a.Technos)
 			}
@@ -101,23 +89,12 @@ func  (a *Analyze) analyze_dom_valued(technoName string,domElement interface{}){
 		a.Technos = technologies.CheckRequired(technoTemp.Name, a.ResultGlobal, a.Technos)
 	} else {
 		regex := strings.Split(domElement.(string), "\\;")
-
-		findregex, _ := regexp.MatchString("(?i)"+regex[0], a.Body)
-		if findregex {
+		re, ok := compileCI(regex[0])
+		if ok && re.MatchString(a.Body) {
 			//fmt.Println(technoName)
 			technoTemp := a.NewTechno(technoName)
-			compiledregex := regexp.MustCompile("(?i)" + regex[0])
-			regexGroup := compiledregex.FindAllStringSubmatch(a.Body, -1)
-			
-			if len(regex) > 1 && strings.HasPrefix(regex[1], "version") {
-				versionGrp := strings.Split(regex[1], "\\")
-
-				if len(versionGrp) > 1 {
-					offset, _ := strconv.Atoi(versionGrp[1])
-					//fmt.Println(regexGroup[0][offset])
-					technoTemp.Version = regexGroup[0][offset]
-				}
-			}
+			regexGroup := re.FindAllStringSubmatch(a.Body, -1)
+			technoTemp.Version = versionFromMarker(regex, regexGroup)
 			a.Technos = append(a.Technos, technoTemp)
 			a.Technos = technologies.CheckRequired(technoTemp.Name, a.ResultGlobal, a.Technos)
 		}

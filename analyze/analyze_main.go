@@ -20,6 +20,7 @@ type Analyze struct {
 	CookiesList 	[]*network.Cookie
 	Node 			*cdp.Node
 	Body 			string
+	Doc 			*goquery.Document
 	Technos    		[]structure.Technologie
 	DnsData			*retryabledns.DNSData
 	CertVhost		[]string
@@ -30,7 +31,12 @@ type Analyze struct {
 
 
 func (a *Analyze) Run() []structure.Technologie {
-	doc, _ := goquery.NewDocumentFromReader(strings.NewReader(a.Body))
+	// Reuse the document already parsed by the caller (launchChrome) when
+	// available; only parse here as a fallback (e.g. unit tests).
+	doc := a.Doc
+	if doc == nil {
+		doc, _ = goquery.NewDocumentFromReader(strings.NewReader(a.Body))
+	}
 	//a.Hote := Host{}
 	for technoName, _ := range a.ResultGlobal {
 		for key, _ := range a.ResultGlobal[technoName].(map[string]interface{}) {

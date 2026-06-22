@@ -87,11 +87,25 @@ func DownloadTechnologies() (string, error) {
 
 		body, err := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
-		file, _ := os.OpenFile(
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "skip %v.json: read error: %v\n", f, err)
+			continue
+		}
+		// A 404/HTML error page must not be written as fingerprint data and
+		// then merged silently — skip any shard that didn't return 200 OK.
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(os.Stderr, "skip %v.json: unexpected status %d\n", f, resp.StatusCode)
+			continue
+		}
+		file, err := os.OpenFile(
 			folder+"/"+f+".json",
 			os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
 			0666,
 		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "skip %v.json: %v\n", f, err)
+			continue
+		}
 		file.Write(body)
 		file.Close()
 
@@ -100,28 +114,35 @@ func DownloadTechnologies() (string, error) {
 }
 
 func LoadTechnologiesFiles(folder string) map[string]interface{} {
-
-	// Open our jsonFile
-	var resultGlobal map[string]interface{}
+	resultGlobal := make(map[string]interface{})
 	for _, s := range lib.Find(folder, ".json") {
-
-		jsonFile, err := os.Open(s)
-		// if we os.Open returns an error then handle it
+		result, err := loadTechnologyFile(s)
 		if err != nil {
-			fmt.Println(err)
+			// A corrupt or unreadable shard is skipped (and reported) instead
+			// of being merged as empty/garbage and silently degrading detection.
+			fmt.Fprintf(os.Stderr, "skip %v: %v\n", s, err)
+			continue
 		}
-		// defer the closing of our jsonFile so that we can parse it later on
-		defer jsonFile.Close()
-
-		byteValue, _ := ioutil.ReadAll(jsonFile)
-
-		var result map[string]interface{}
-
-		json.Unmarshal([]byte(byteValue), &result)
-		mergo.Merge(&resultGlobal, result)
-
+		if err := mergo.Merge(&resultGlobal, result); err != nil {
+			fmt.Fprintf(os.Stderr, "merge %v: %v\n", s, err)
+		}
 	}
 	return resultGlobal
+}
+
+// loadTechnologyFile reads and parses a single fingerprint shard. The file is
+// fully read and closed before returning, so descriptors are released per
+// iteration rather than piling up until LoadTechnologiesFiles returns.
+func loadTechnologyFile(path string) (map[string]interface{}, error) {
+	byteValue, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(byteValue, &result); err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 func DedupTechno(technologies []structure.Technologie) []structure.Technologie {
 	var output []structure.Technologie

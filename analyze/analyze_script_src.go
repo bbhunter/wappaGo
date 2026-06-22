@@ -2,8 +2,6 @@ package analyze
 
 import (
 	"fmt"
-	"regexp"
-	"strconv"
 	"strings"
 	"github.com/EasyRecon/wappaGo/technologies"
 )
@@ -23,19 +21,11 @@ func (a *Analyze)analyze_scriptSrc_main(technoName string,key string){
 
 func  (a *Analyze) analyze_scriptSrc(technoName string,regexStr string,scriptCrc string){
 	regex := strings.Split(fmt.Sprintf("%v", regexStr), "\\;")
-	findRegex, _ := regexp.MatchString("(?i)"+regex[0], scriptCrc)
-	if findRegex {
+	re, ok := compileCI(regex[0])
+	if ok && re.MatchString(scriptCrc) {
 		technoTemp := a.NewTechno(technoName)
-		compiledregex := regexp.MustCompile("(?i)" + regex[0])
-		regexGroup := compiledregex.FindAllStringSubmatch(scriptCrc, -1)
-
-		if len(regex) > 1 && strings.HasPrefix(regex[1], "version") {
-			versionGrp := strings.Split(regex[1], "\\")
-			if len(versionGrp) > 1 {
-				offset, _ := strconv.Atoi(versionGrp[1])
-				technoTemp.Version = regexGroup[0][offset]
-			}
-		}
+		regexGroup := re.FindAllStringSubmatch(scriptCrc, -1)
+		technoTemp.Version = versionFromMarker(regex, regexGroup)
 		a.Technos = append(a.Technos, technoTemp)
 		a.Technos = technologies.CheckRequired(technoTemp.Name, a.ResultGlobal, a.Technos)
 	}

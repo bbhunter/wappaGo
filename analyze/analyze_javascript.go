@@ -23,7 +23,7 @@ func  (a *Analyze) analyze_js_valued(regexStr string, js string, technoName stri
 	if regex[0] != "" {
 		chromedp.Evaluate("(()=>{return "+js+".match(/"+regex[0]+"/gm)[0]})()", &res).Do(a.Ctx)
 	} else {
-		chromedp.Evaluate("(()=>{return (typeof "+js+" !== 'undefined' ? true : false})()", &res).Do(a.Ctx)
+		chromedp.Evaluate("(()=>{return (typeof "+js+" !== 'undefined' ? true : false)})()", &res).Do(a.Ctx)
 	}
 	if res != nil && res != false {
 		technoTemp := a.NewTechno(technoName)
@@ -32,7 +32,7 @@ func  (a *Analyze) analyze_js_valued(regexStr string, js string, technoName stri
 				technoTemp.Confidence = strings.Split(regex[1], ":")[1]
 			}
 			if len(regex) > 2 && strings.HasPrefix(regex[2], "confidence") {
-				technoTemp.Confidence = strings.Split(regex[1], ":")[1]
+				technoTemp.Confidence = strings.Split(regex[2], ":")[1]
 			}
 		}
 		if (len(regex) > 1 && strings.HasPrefix(regex[1], "version")) || (len(regex) > 2 && strings.HasPrefix(regex[2], "version")) {
