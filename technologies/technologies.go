@@ -83,8 +83,13 @@ func AddTechno(name string, tech []structure.Technologie, technoList map[string]
 
 func DownloadTechnologies() (string, error) {
 	files := []string{"_", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"}
-	folder := lib.RandStringBytes(20)
-	_ = os.Mkdir(folder, 0766)
+	// Create the working dir under the system temp location, not the current
+	// working directory, so the downloaded fingerprint shards never land in
+	// (and get accidentally committed to) the repository.
+	folder, err := os.MkdirTemp("", "wappago-")
+	if err != nil {
+		return "", err
+	}
 	for _, f := range files {
 		url := fmt.Sprintf("%v/technologies/%v.json", structure.WappazlyerRoot, f)
 		resp, err := http.Get(url)
