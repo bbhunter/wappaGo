@@ -14,6 +14,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -41,6 +42,7 @@ type Cmd struct {
 	Cdn          *cdncheck.Client
 	Options      structure.Options
 	PortOpenByIP []structure.PortOpenByIp
+	portMu       sync.Mutex // guards PortOpenByIP
 	HttpClient   *http.Client
 	ResultArray  []structure.Data
 	Input        []string
@@ -129,25 +131,33 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 		CdnName = cdnName
 	}
 	var portOpen []string
+	c.portMu.Lock()
 	alreadyScanned := lib.CheckIpAlreadyScan(ip, c.PortOpenByIP)
+	c.portMu.Unlock()
 	if alreadyScanned.IP != "" {
 		portOpen = alreadyScanned.Open_port
 	} else {
+		// Each scanner goroutine reports its open port on a buffered channel
+		// instead of appending to a shared slice (which raced). The buffer is
+		// sized to the port count so a send never blocks.
+		portChan := make(chan string, len(portTemp))
 		for _, portEnum := range portTemp {
 			swg1.Add()
 			go func(portEnum string, url string) {
 				defer swg1.Done()
-				openPort := c.scanPort("tcp", url, portEnum, *c.Options.Porttimeout)
-				if openPort {
-					portOpen = append(portOpen, portEnum)
+				if c.scanPort("tcp", url, portEnum, *c.Options.Porttimeout) {
+					portChan <- portEnum
 				}
 			}(portEnum, url)
 		}
 		swg1.Wait()
-		var tempScanned structure.PortOpenByIp
-		tempScanned.IP = ip
-		tempScanned.Open_port = portOpen
-		c.PortOpenByIP = append(c.PortOpenByIP, tempScanned)
+		close(portChan)
+		for p := range portChan {
+			portOpen = append(portOpen, p)
+		}
+		c.portMu.Lock()
+		c.PortOpenByIP = append(c.PortOpenByIP, structure.PortOpenByIp{IP: ip, Open_port: portOpen})
+		c.portMu.Unlock()
 	}
 	url = strings.TrimSpace(url)
 	for _, port := range portOpen {

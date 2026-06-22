@@ -35,7 +35,7 @@ func StartReconSync(input []string, wrapperOptions structure.WrapperOptions) []s
 	return resultGlobal
 }
 
-func configureOptions(wrapperOptions structure.WrapperOptions) cmd.Cmd {
+func configureOptions(wrapperOptions structure.WrapperOptions) *cmd.Cmd {
 	options := structure.Options{}
 	falseBool := false
 
@@ -66,7 +66,7 @@ func configureOptions(wrapperOptions structure.WrapperOptions) cmd.Cmd {
 	}
 	defer os.RemoveAll(folder)
 
-	c := cmd.Cmd{}
+	c := &cmd.Cmd{}
 	c.ResultGlobal = technologies.LoadTechnologiesFiles(folder)
 	c.Options = options
 
