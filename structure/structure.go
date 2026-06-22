@@ -60,6 +60,7 @@ type Options struct {
 	UserAgent      *string
 	Rps            *float64
 	Jitter         *int
+	NoProgress     *bool
 }
 type WrapperOptions struct {
 	Screenshot     string

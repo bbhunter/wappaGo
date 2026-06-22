@@ -111,17 +111,20 @@ func (c *Cmd) Start(results chan structure.Data) {
 	swg := sizedwaitgroup.New(*c.Options.Threads)
 	url = ""
 	ip = ""
+	prog := newProgress(len(c.Input), *c.Options.NoProgress)
 	for _, line := range c.Input {
 		ip = ""
 		if *c.Options.AmassInput {
 			var result map[string]interface{}
 			if err := json.Unmarshal([]byte(line), &result); err != nil {
 				fmt.Fprintf(os.Stderr, "skip amass line: %v\n", err)
+				prog.inc()
 				continue
 			}
 			name, ok := result["name"].(string)
 			if !ok {
 				fmt.Fprintf(os.Stderr, "skip amass line: missing name\n")
+				prog.inc()
 				continue
 			}
 			url = name
@@ -140,6 +143,7 @@ func (c *Cmd) Start(results chan structure.Data) {
 		swg.Add()
 		go func(url string, ip string) {
 			defer swg.Done()
+			defer prog.inc()
 			defer func() {
 				if r := recover(); r != nil {
 					fmt.Fprintf(os.Stderr, "recovered while scanning %s: %v\n", url, r)
@@ -149,6 +153,7 @@ func (c *Cmd) Start(results chan structure.Data) {
 		}(url, ip)
 	}
 	swg.Wait()
+	prog.finish()
 	// Render the HTML report exactly once, from the complete result set, after
 	// all targets finish. Previously launchChrome regenerated the whole file
 	// after every host (O(n^2) rewrites with concurrent writers).

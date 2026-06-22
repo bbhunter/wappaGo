@@ -38,6 +38,7 @@ func StartReconSync(input []string, wrapperOptions structure.WrapperOptions) []s
 func configureOptions(wrapperOptions structure.WrapperOptions) *cmd.Cmd {
 	options := structure.Options{}
 	falseBool := false
+	trueBool := true
 
 	options.Screenshot = &wrapperOptions.Screenshot
 	options.Ports = &wrapperOptions.Ports
@@ -53,6 +54,7 @@ func configureOptions(wrapperOptions structure.WrapperOptions) *cmd.Cmd {
 	options.UserAgent = &wrapperOptions.UserAgent
 	options.Rps = &wrapperOptions.Rps
 	options.Jitter = &wrapperOptions.Jitter
+	options.NoProgress = &trueBool // library mode: no stderr progress bar
 
 	if *options.Screenshot != "" {
 		if _, err := os.Stat(*options.Screenshot); errors.Is(err, os.ErrNotExist) {
