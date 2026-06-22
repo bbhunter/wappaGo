@@ -12,9 +12,11 @@ import (
 	"net/http"
 	URL "net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -70,8 +72,14 @@ func (c *Cmd) Start(results chan structure.Data) {
 		optionsChromeCtx = append(optionsChromeCtx, chromedp.ProxyServer(*c.Options.Proxy))
 	}
 
+	// Tie the browser lifetime to SIGINT/SIGTERM: the first Ctrl+C cancels this
+	// context, which tears Chrome down and lets the deferred cleanup (browser
+	// processes, dialer, temp fingerprint dir) run instead of leaving orphans.
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	//ctxAlloc, cancel := chromedp.NewExecAllocator(context.Background(), append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false), chromedp.Flag("disable-gpu", true))...)
-	ctxAlloc, cancel1 := chromedp.NewExecAllocator(context.Background(), optionsChromeCtx...)
+	ctxAlloc, cancel1 := chromedp.NewExecAllocator(sigCtx, optionsChromeCtx...)
 	defer cancel1()
 
 	ctxAlloc1, cancel := chromedp.NewContext(ctxAlloc)
@@ -79,7 +87,12 @@ func (c *Cmd) Start(results chan structure.Data) {
 	defer cancel()
 
 	if err := chromedp.Run(c.ChromeCtx); err != nil {
-		panic(err)
+		// Startup failure (including a cancel during launch) is reported and the
+		// results channel is closed so the consumer drains and exits cleanly,
+		// rather than panicking and skipping cleanup.
+		fmt.Fprintf(os.Stderr, "could not start Chrome: %v\n", err)
+		close(results)
+		return
 	}
 
 	c.Cdn = cdncheck.New()
