@@ -55,7 +55,7 @@ var cardTmpl = template.Must(template.New("card").Parse(`
       <a class="open" href="{{.Url}}" target="_blank" rel="noopener" title="Open {{.Url}}">↗</a>
     </header>
     {{if .HasShot}}
-    <button class="shot" data-full="{{.ScreenshotSrc}}" aria-label="Enlarge screenshot of {{.Host}}">
+    <button type="button" class="shot" data-full="{{.ScreenshotSrc}}" aria-label="Enlarge screenshot of {{.Host}}">
       <img src="{{.ScreenshotSrc}}" alt="Screenshot of {{.Host}}" loading="lazy">
     </button>
     {{else}}
@@ -363,6 +363,10 @@ details summary .n{margin-left:auto;font-family:var(--mono);background:var(--pan
 .lightbox.open{display:grid}
 .lightbox img{max-width:100%;max-height:100%;border-radius:10px;border:1px solid var(--line);
   box-shadow:0 30px 80px -30px #000}
+.lb-close{position:absolute;top:18px;right:22px;width:40px;height:40px;display:grid;place-items:center;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:10px;
+  font-size:22px;line-height:1;cursor:pointer}
+.lb-close:hover{color:var(--accent);border-color:var(--accent)}
 
 @keyframes blink{50%{opacity:0}}
 @media (max-width:640px){
@@ -386,7 +390,10 @@ details summary .n{margin-left:auto;font-family:var(--mono);background:var(--pan
 </header>`
 
 const pageFoot = `</main>
-<div id="lightbox" class="lightbox" aria-hidden="true"><img alt="Enlarged screenshot"></div>
+<div id="lightbox" class="lightbox" aria-hidden="true">
+  <button type="button" class="lb-close" aria-label="Close">&times;</button>
+  <img alt="Enlarged screenshot">
+</div>
 <script>
 (function(){
   var cards = Array.prototype.slice.call(document.querySelectorAll('.card'));
@@ -401,11 +408,12 @@ const pageFoot = `</main>
       cards[i].classList.toggle('hidden', !hit);
       if(hit) shown++;
     }
-    count.textContent = q ? (shown + ' / ' + total) : (total + ' shown');
+    if(count) count.textContent = q ? (shown + ' / ' + total) : (total + ' shown');
   }
   filter.addEventListener('input', update);
   update();
 
+  // Broken screenshots fall back to the placeholder.
   var imgs = document.querySelectorAll('.shot img');
   for(var j=0;j<imgs.length;j++){
     imgs[j].addEventListener('error', function(e){
@@ -415,18 +423,20 @@ const pageFoot = `</main>
     });
   }
 
+  // Lightbox via event delegation: one document-level handler so every
+  // screenshot is clickable and clicking anywhere else (or the close button)
+  // dismisses it.
   var box = document.getElementById('lightbox');
   var boxImg = box.querySelector('img');
-  var shots = document.querySelectorAll('.shot[data-full]');
-  for(var k=0;k<shots.length;k++){
-    shots[k].addEventListener('click', function(e){
-      boxImg.src = e.currentTarget.dataset.full;
-      box.classList.add('open');
-    });
-  }
-  function closeBox(){ box.classList.remove('open'); boxImg.src=''; }
-  box.addEventListener('click', closeBox);
-  document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeBox(); });
+  function closeBox(){ box.classList.remove('open'); boxImg.removeAttribute('src'); }
+  document.addEventListener('click', function(e){
+    var shot = e.target.closest('.shot[data-full]');
+    if(shot){ boxImg.src = shot.dataset.full; box.classList.add('open'); return; }
+    if(box.classList.contains('open')) closeBox();
+  });
+  document.addEventListener('keydown', function(e){
+    if(e.key === 'Escape' && box.classList.contains('open')) closeBox();
+  });
 })();
 </script>
 </body>
