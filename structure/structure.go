@@ -16,6 +16,11 @@ type Technologie struct {
 const WappazlyerRoot = "https://raw.githubusercontent.com/dochne/wappalyzer/master/src"
 const LetterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+// DefaultUserAgent is presented by both the raw HTTP probe and Chrome so a WAF
+// sees one consistent, browser-like client instead of "Go-http-client" then
+// "HeadlessChrome".
+const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
 var InterrestingKey = []string{"dns", "js", "meta", "text", "dom", "script", "html", "scriptSrc", "headers", "cookies", "url", "certIssuer", "xhr"}
 
 type Host struct {
@@ -52,6 +57,7 @@ type Options struct {
 	ChromeThreads  *int
 	Report         *bool
 	Proxy          *string
+	UserAgent      *string
 }
 type WrapperOptions struct {
 	Screenshot     string
@@ -63,6 +69,7 @@ type WrapperOptions struct {
 	ChromeTimeout  int
 	ChromeThreads  int
 	Proxy          string
+	UserAgent      string
 }
 type Response struct {
 	StatusCode    int

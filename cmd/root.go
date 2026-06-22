@@ -69,6 +69,10 @@ func (c *Cmd) Start(results chan structure.Data) {
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-webgl", true))
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("ignore-certificate-errors", true)) // RIP shittyproxy.go
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.WindowSize(1400, 900))
+	// Present a real browser UA (drops the "HeadlessChrome" token) and hide the
+	// automation flag, so Chrome blends in with normal traffic.
+	optionsChromeCtx = append(optionsChromeCtx, chromedp.UserAgent(c.userAgent()))
+	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-blink-features", "AutomationControlled"))
 	if *c.Options.Proxy != "" {
 		optionsChromeCtx = append(optionsChromeCtx, chromedp.ProxyServer(*c.Options.Proxy))
 	}
@@ -239,6 +243,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 	var errSSL error
 	if port != "80" {
 		request, _ := http.NewRequest("GET", "https://"+urlDataPort, nil)
+		setBrowserHeaders(request, c.userAgent())
 		resp, errSSL = Do(request, client)
 	}
 	if errSSL != nil || port == "80" {
@@ -246,6 +251,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 			errorContinue = false
 		} else {
 			request, _ := http.NewRequest("GET", "http://"+urlDataPort, nil)
+			setBrowserHeaders(request, c.userAgent())
 			resp, errPlain := Do(request, client)
 			if errPlain != nil || resp == nil {
 
@@ -420,6 +426,50 @@ func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) 
 	}
 	defer conn.Close()
 	return true
+}
+
+// userAgent returns the configured User-Agent, falling back to the built-in
+// browser UA when none is set (e.g. library mode with an empty option).
+func (c *Cmd) userAgent() string {
+	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
+		return *c.Options.UserAgent
+	}
+	return structure.DefaultUserAgent
+}
+
+// setBrowserHeaders makes the raw HTTP probe look like the same Chrome that
+// drives the rendering pass, so a WAF sees one consistent browser instead of
+// the default "Go-http-client/1.1". Accept-Encoding is left unset on purpose so
+// Go keeps decompressing gzip transparently.
+func setBrowserHeaders(req *http.Request, ua string) {
+	h := req.Header
+	h.Set("User-Agent", ua)
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	h.Set("Accept-Language", "en-US,en;q=0.9")
+	h.Set("Upgrade-Insecure-Requests", "1")
+	h.Set("Sec-Fetch-Dest", "document")
+	h.Set("Sec-Fetch-Mode", "navigate")
+	h.Set("Sec-Fetch-Site", "none")
+	h.Set("Sec-Fetch-User", "?1")
+	if v := chromeMajor(ua); v != "" {
+		h.Set("Sec-Ch-Ua", `"Google Chrome";v="`+v+`", "Chromium";v="`+v+`", "Not_A Brand";v="24"`)
+		h.Set("Sec-Ch-Ua-Mobile", "?0")
+		h.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	}
+}
+
+// chromeMajor extracts the Chrome major version from a UA string ("" if none).
+func chromeMajor(ua string) string {
+	i := strings.Index(ua, "Chrome/")
+	if i < 0 {
+		return ""
+	}
+	rest := ua[i+len("Chrome/"):]
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	return rest[:j]
 }
 
 // Do http request

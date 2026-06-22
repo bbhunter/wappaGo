@@ -50,6 +50,7 @@ func configureOptions(wrapperOptions structure.WrapperOptions) *cmd.Cmd {
 	options.AmassInput = &falseBool
 	options.FollowRedirect = &wrapperOptions.FollowRedirect
 	options.Proxy = &wrapperOptions.Proxy
+	options.UserAgent = &wrapperOptions.UserAgent
 
 	if *options.Screenshot != "" {
 		if _, err := os.Stat(*options.Screenshot); errors.Is(err, os.ErrNotExist) {

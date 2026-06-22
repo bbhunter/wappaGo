@@ -27,6 +27,7 @@ func main() {
 	options.AmassInput = flag.Bool("amass-input", false, "Pip directly on Amass (Amass json output) like amass -d domain.tld | wappaGo")
 	options.FollowRedirect = flag.Bool("follow-redirect", false, "Follow redirect to detect technologie")
 	options.Proxy = flag.String("proxy", "", "Use http proxy")
+	options.UserAgent = flag.String("user-agent", structure.DefaultUserAgent, "User-Agent sent by both the HTTP probe and Chrome (blank keeps the built-in browser UA)")
 	flag.Parse()
 	configure(options)
 }
