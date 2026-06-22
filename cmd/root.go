@@ -50,6 +50,12 @@ func (c *Cmd) Start(results chan structure.Data) {
 	c.Dialer = c.InitDialer()
 	defer c.Dialer.Close()
 
+	// Build the HTTP client once, up front: it is read-only for the rest of
+	// the run and shared across all target goroutines. Previously it was
+	// rebuilt per target on the shared c.HttpClient field (a data race), and
+	// the process-global http.DefaultTransport was mutated per request.
+	c.HttpClient = c.buildHTTPClient()
+
 	optionsChromeCtx := []chromedp.ExecAllocatorOption{}
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.DefaultExecAllocatorOptions[:]...)
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("headless", true))
@@ -105,33 +111,6 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 	swg := sizedwaitgroup.New(*c.Options.ChromeThreads)
 	var CdnName string
 	portTemp := portList
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DialContext:       c.Dialer.Dial,
-		DisableKeepAlives: true,
-	}
-	if *c.Options.Proxy != "" {
-		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-		if parseErr == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-			transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
-		}
-	}
-	c.HttpClient = &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: transport,
-	}
-	if !*c.Options.FollowRedirect {
-		c.HttpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			//data.Infos.Location = fmt.Sprintf("%s", req.URL)
-			return http.ErrUseLastResponse
-		}
-	}
 
 	if !*c.Options.AmassInput {
 		c.HttpClient.Get("http://" + url)
@@ -196,15 +175,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 	} else {
 		urlDataPort = urlData
 	}
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	if *c.Options.Proxy != "" {
-		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-		if parseErr == nil {
-			http.DefaultTransport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
-			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12}
-		}
-	}
-	client := c.getClientCtx()
+	client := c.HttpClient
 
 	var TempResp structure.Response
 	//resp, errSSL = client.Get("https://" + urlDataPort)
@@ -481,37 +452,36 @@ func (c *Cmd) InitDialer() *fastdialer.Dialer {
 	return dialer
 }
 
-func (c *Cmd) getClientCtx() *http.Client {
-	if c.HttpClient == (&http.Client{}) {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			DialContext:       c.Dialer.Dial,
-			DisableKeepAlives: true,
-		}
-		if *c.Options.Proxy != "" {
-			proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-			if parseErr == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-				transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-				transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
-			}
-		}
-		client := &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: transport,
-		}
-		if !*c.Options.FollowRedirect {
-			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				//data.Infos.Location = fmt.Sprintf("%s", req.URL)
-				return http.ErrUseLastResponse
-			}
-		}
-		return client
-	} else {
-		return c.HttpClient
+// buildHTTPClient constructs the single, shared HTTP client used for every
+// probe. It is called once from Start(); the returned client (and its
+// transport) is never mutated afterwards, so it is safe to share across all
+// target/port goroutines.
+func (c *Cmd) buildHTTPClient() *http.Client {
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		DialContext:       c.Dialer.Dial,
+		DisableKeepAlives: true,
 	}
+	if *c.Options.Proxy != "" {
+		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
+		if parseErr == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+			transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
+		}
+	}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
+	if !*c.Options.FollowRedirect {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return client
 }
 
 func (c *Cmd) DefineBasicMetric(data structure.Data, resp *structure.Response) (structure.Data, structure.Response, error) {
