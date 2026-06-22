@@ -3,7 +3,7 @@ package technologies
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 
@@ -68,7 +68,7 @@ func DownloadTechnologies() (string, error) {
 			return "", err
 		}
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "skip %v.json: read error: %v\n", f, err)

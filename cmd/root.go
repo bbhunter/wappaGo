@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	URL "net/url"
@@ -457,7 +456,7 @@ get_response:
 	// websockets don't have a readable body
 	if httpresp.StatusCode != http.StatusSwitchingProtocols {
 		var err error
-		respbody, err = ioutil.ReadAll(io.LimitReader(httpresp.Body, 4096))
+		respbody, err = io.ReadAll(io.LimitReader(httpresp.Body, 4096))
 		if err != nil {
 
 			return nil, err
