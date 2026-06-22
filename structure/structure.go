@@ -58,6 +58,8 @@ type Options struct {
 	Report         *bool
 	Proxy          *string
 	UserAgent      *string
+	Rps            *float64
+	Jitter         *int
 }
 type WrapperOptions struct {
 	Screenshot     string
@@ -70,6 +72,8 @@ type WrapperOptions struct {
 	ChromeThreads  int
 	Proxy          string
 	UserAgent      string
+	Rps            float64
+	Jitter         int
 }
 type Response struct {
 	StatusCode    int

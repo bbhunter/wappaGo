@@ -51,6 +51,8 @@ func configureOptions(wrapperOptions structure.WrapperOptions) *cmd.Cmd {
 	options.FollowRedirect = &wrapperOptions.FollowRedirect
 	options.Proxy = &wrapperOptions.Proxy
 	options.UserAgent = &wrapperOptions.UserAgent
+	options.Rps = &wrapperOptions.Rps
+	options.Jitter = &wrapperOptions.Jitter
 
 	if *options.Screenshot != "" {
 		if _, err := os.Stat(*options.Screenshot); errors.Is(err, os.ErrNotExist) {

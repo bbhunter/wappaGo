@@ -28,6 +28,8 @@ func main() {
 	options.FollowRedirect = flag.Bool("follow-redirect", false, "Follow redirect to detect technologie")
 	options.Proxy = flag.String("proxy", "", "Use http proxy")
 	options.UserAgent = flag.String("user-agent", structure.DefaultUserAgent, "User-Agent sent by both the HTTP probe and Chrome (blank keeps the built-in browser UA)")
+	options.Rps = flag.Float64("rps", 0, "Max HTTP requests per second per host to stay under rate-based WAF rules (0 = unlimited)")
+	options.Jitter = flag.Int("jitter", 0, "Max random delay in ms added before each request (0 = none)")
 	flag.Parse()
 	configure(options)
 }

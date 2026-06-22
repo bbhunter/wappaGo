@@ -48,6 +48,7 @@ type Cmd struct {
 	HttpClient   *http.Client
 	ResultArray  []structure.Data
 	reportMu     sync.Mutex // guards ResultArray (report mode)
+	throttle     *hostThrottle
 	Input        []string
 }
 
@@ -60,6 +61,10 @@ func (c *Cmd) Start(results chan structure.Data) {
 	// rebuilt per target on the shared c.HttpClient field (a data race), and
 	// the process-global http.DefaultTransport was mutated per request.
 	c.HttpClient = c.buildHTTPClient()
+
+	// Per-host request pacing to stay under rate-based WAF rules (no-op unless
+	// -rps or -jitter is set).
+	c.throttle = newHostThrottle(*c.Options.Rps, *c.Options.Jitter)
 
 	optionsChromeCtx := []chromedp.ExecAllocatorOption{}
 	optionsChromeCtx = append(optionsChromeCtx, chromedp.DefaultExecAllocatorOptions[:]...)
@@ -161,6 +166,7 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 	portTemp := portList
 
 	if !*c.Options.AmassInput {
+		c.throttle.wait(url)
 		c.HttpClient.Get("http://" + url)
 		ip = c.Dialer.GetDialedIP(url)
 	}
@@ -242,6 +248,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 	//resp, errSSL = client.Get("https://" + urlDataPort)
 	var errSSL error
 	if port != "80" {
+		c.throttle.wait(urlData)
 		request, _ := http.NewRequest("GET", "https://"+urlDataPort, nil)
 		setBrowserHeaders(request, c.userAgent())
 		resp, errSSL = Do(request, client)
@@ -250,6 +257,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 		if port == "443" {
 			errorContinue = false
 		} else {
+			c.throttle.wait(urlData)
 			request, _ := http.NewRequest("GET", "http://"+urlDataPort, nil)
 			setBrowserHeaders(request, c.userAgent())
 			resp, errPlain := Do(request, client)
@@ -327,6 +335,7 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 	//var res []string
 	var buf []byte
 
+	c.throttle.wait(data.Infos.Data)
 	err = chromedp.Run(cloneCTX,
 		chromedp.Navigate(urlData),
 		chromedp.Title(&data.Infos.Title),
