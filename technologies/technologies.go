@@ -16,54 +16,25 @@ func CheckRequired(technoName string, technoList map[string]interface{}, tech []
 	if !ok {
 		return tech
 	}
-	for name, _ := range entry {
-		if name == "requires" {
-			requires := entry["requires"]
-			// Tentative d'assertion du type directement en string
-			if reqString, ok := requires.(string); ok {
-			    tech = AddTechno(reqString, tech, technoList)
-			} else if reqMap, ok := requires.(map[string]interface{}); ok {
-			    // Le contenu de requires est un map[string]interface{}, on itère sur les clés
-			    for req := range reqMap {
-			        tech = AddTechno(req, tech, technoList)
-			    }
-			} else if reqSlice, ok := requires.([]interface{}); ok {
-			    // Le contenu de requires est un slice d'interface{}, on itère sur les éléments
-			    for _, item := range reqSlice {
-			        if itemStr, ok := item.(string); ok {
-			            tech = AddTechno(itemStr, tech, technoList)
-			        } else {
-			            fmt.Println("Unsupported item type in 'requires' slice")
-			        }
-			    }
-			} else {
-			    // Si aucun des types attendus n'est rencontré, affiche une erreur
-			    fmt.Println("Unexpected type for 'requires'")
+	// Only "implies" adds technologies (X implies Y means Y is also present).
+	// "requires" is a precondition, NOT an assertion: it is enforced after all
+	// detection by FilterRequired, so it is intentionally ignored here.
+	implies, ok := entry["implies"]
+	if !ok {
+		return tech
+	}
+	switch v := implies.(type) {
+	case string:
+		tech = AddTechno(v, tech, technoList)
+	case []interface{}:
+		for _, item := range v {
+			if strItem, ok := item.(string); ok {
+				tech = AddTechno(strItem, tech, technoList)
 			}
 		}
-		if name == "implies" {
-			implies := entry["implies"]
-			switch v := implies.(type) {
-			case string:
-			    // Si c'est une chaîne, on ajoute directement la technologie
-			    tech = AddTechno(v, tech, technoList)
-			case []interface{}:
-			    // Si c'est un slice, on itère sur chaque élément
-			    for _, item := range v {
-			        if strItem, ok := item.(string); ok {
-			            tech = AddTechno(strItem, tech, technoList)
-			        } else {
-			            fmt.Println("Unexpected item type in 'implies' slice")
-			        }
-			    }
-			case map[string]interface{}:
-			    // Si c'est un map, on itère sur chaque clé
-			    for key := range v {
-			        tech = AddTechno(key, tech, technoList)
-			    }
-			default:
-			    fmt.Println("Unexpected type for 'implies'")
-			}
+	case map[string]interface{}:
+		for key := range v {
+			tech = AddTechno(key, tech, technoList)
 		}
 	}
 	return tech
@@ -178,4 +149,73 @@ func DedupTechno(technologies []structure.Technologie) []structure.Technologie {
 		}
 	}
 	return output
+}
+
+// FilterRequired enforces Wappalyzer "requires" preconditions: a detected
+// technology is kept only if every technology it requires is also present in
+// the result set. Unlike "implies" (which asserts a dependency), "requires"
+// gates the detection itself, so this drops false positives such as a plugin
+// reported without the platform it depends on.
+//
+// It iterates to a fixpoint so a chain (A requires B requires C) collapses
+// correctly when the root is missing. "requiresCategory" is not enforced
+// because categories are not loaded.
+func FilterRequired(techs []structure.Technologie, technoList map[string]interface{}) []structure.Technologie {
+	for {
+		detected := make(map[string]bool, len(techs))
+		for _, t := range techs {
+			detected[t.Name] = true
+		}
+		kept := techs[:0:0]
+		for _, t := range techs {
+			if requiresSatisfied(t.Name, technoList, detected) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == len(techs) {
+			return kept
+		}
+		techs = kept
+	}
+}
+
+func requiresSatisfied(name string, technoList map[string]interface{}, detected map[string]bool) bool {
+	entry, ok := technoList[name].(map[string]interface{})
+	if !ok {
+		return true
+	}
+	requires, ok := entry["requires"]
+	if !ok {
+		return true
+	}
+	for _, req := range requiredNames(requires) {
+		if !detected[req] {
+			return false
+		}
+	}
+	return true
+}
+
+// requiredNames normalises a "requires" value (string, []interface{} or
+// map[string]interface{}) into the list of required technology names.
+func requiredNames(requires interface{}) []string {
+	switch v := requires.(type) {
+	case string:
+		return []string{v}
+	case []interface{}:
+		var out []string
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	case map[string]interface{}:
+		var out []string
+		for k := range v {
+			out = append(out, k)
+		}
+		return out
+	}
+	return nil
 }

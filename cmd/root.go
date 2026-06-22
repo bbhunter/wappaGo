@@ -385,6 +385,9 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 	)
 
 	data.Infos.Technologies = technologies.DedupTechno(data.Infos.Technologies)
+	// Drop technologies whose "requires" precondition isn't met by the rest of
+	// the detected set (e.g. a plugin without the platform it needs).
+	data.Infos.Technologies = technologies.FilterRequired(data.Infos.Technologies, c.ResultGlobal)
 	if *c.Options.Screenshot != "" && len(buf) > 0 {
 		// Name the screenshot by the SHA-1 of its URL. The previous scheme
 		// stripped ':' '/' '.' from the URL, which collapsed distinct URLs to

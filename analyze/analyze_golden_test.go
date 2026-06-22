@@ -165,6 +165,50 @@ func TestImpliesMissingTechnoNoPanic(t *testing.T) {
 	}
 }
 
+// TestRequiresGate pins the requires-vs-implies behaviour change: a technology
+// with a "requires" precondition is kept only when the required technology is
+// independently detected, and is dropped otherwise (the old code added the
+// required techno unconditionally, producing false positives).
+func TestRequiresGate(t *testing.T) {
+	rg := map[string]interface{}{
+		"WPPlugin": map[string]interface{}{
+			"html":     "wp-plugin-marker",
+			"requires": "WordPress",
+		},
+		"WordPress": map[string]interface{}{
+			"meta": map[string]interface{}{"generator": "WordPress"},
+		},
+	}
+
+	// WordPress present -> the plugin survives the gate.
+	a := Analyze{
+		ResultGlobal: rg,
+		Body: `<html><head><meta name="generator" content="WordPress"></head>` +
+			`<body>wp-plugin-marker</body></html>`,
+	}
+	got := technologies.FilterRequired(technologies.DedupTechno(a.Run()), rg)
+	names := technologyVersions(got)
+	for _, want := range []string{"WordPress", "WPPlugin"} {
+		if _, ok := names[want]; !ok {
+			t.Errorf("expected %q kept when WordPress is present (got %v)", want, technologyNames(got))
+		}
+	}
+
+	// WordPress absent -> the plugin is dropped, and nothing is fabricated.
+	b := Analyze{
+		ResultGlobal: rg,
+		Body:         `<html><body>wp-plugin-marker</body></html>`,
+	}
+	got2 := technologies.FilterRequired(technologies.DedupTechno(b.Run()), rg)
+	names2 := technologyVersions(got2)
+	if _, ok := names2["WPPlugin"]; ok {
+		t.Errorf("WPPlugin should be dropped when required WordPress is absent (got %v)", technologyNames(got2))
+	}
+	if _, ok := names2["WordPress"]; ok {
+		t.Errorf("WordPress must not be fabricated by a requires edge (got %v)", technologyNames(got2))
+	}
+}
+
 // TestCompileCICachesAndToleratesBadPatterns documents the contract the
 // matchers rely on: valid patterns compile (and are cached), invalid RE2
 // patterns return ok=false instead of panicking.
