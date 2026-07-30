@@ -1,0 +1,72 @@
+name: Release
+
+# Attach binaries to a release when its tag is pushed.
+#
+# release-0.2 shipped with no assets at all while every release before it carried
+# a Linux and a Windows binary, and the README tells people to download one. This
+# job removes the manual step that was forgotten.
+on:
+  push:
+    tags:
+      - 'release-*'
+  # Lets an existing tag be re-published without moving it, e.g. after fixing
+  # this workflow.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release-* tag to build and attach assets to'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch checks out the default branch, so the requested tag
+          # has to be named explicitly.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Never attach binaries built from a tree that does not pass. The stealth
+      # harness is opt-in (it needs a browser and the network), so it stays
+      # skipped here; everything else runs offline.
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: 0
+        run: |
+          mkdir -p dist
+          # Names match the assets on every release up to 0.1.0, so existing
+          # download links and scripts keep working.
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/wappaGo_linux_x64
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o dist/wappaGo_win_x64.exe
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o dist/wappaGo_darwin_arm64
+          ls -lh dist
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # The release is normally created by hand before the tag is pushed;
+          # create it only if it is missing, so a hand-written body is never
+          # overwritten.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" dist/* --clobber
