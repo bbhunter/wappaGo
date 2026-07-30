@@ -20,16 +20,17 @@ func TestSetBrowserHeadersOnWire(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	id := fallbackIdentity()
 	req, _ := http.NewRequest("GET", srv.URL, nil)
-	setBrowserHeaders(req, structure.DefaultUserAgent)
+	setBrowserHeaders(req, id)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 
-	if ua := got.Get("User-Agent"); ua != structure.DefaultUserAgent {
-		t.Errorf("User-Agent = %q, want %q", ua, structure.DefaultUserAgent)
+	if ua := got.Get("User-Agent"); ua != id.UserAgent {
+		t.Errorf("User-Agent = %q, want %q", ua, id.UserAgent)
 	}
 	if strings.Contains(got.Get("User-Agent"), "Go-http-client") {
 		t.Errorf("default Go User-Agent leaked")
@@ -39,8 +40,38 @@ func TestSetBrowserHeadersOnWire(t *testing.T) {
 			t.Errorf("missing browser header %q", hdr)
 		}
 	}
-	if v := got.Get("Sec-Ch-Ua"); !strings.Contains(v, `v="131"`) {
-		t.Errorf("Sec-CH-UA = %q, want it derived from Chrome 131", v)
+	if v := got.Get("Sec-Ch-Ua"); !strings.Contains(v, `v="`+id.Major+`"`) {
+		t.Errorf("Sec-CH-UA = %q, want it derived from the identity's major %q", v, id.Major)
+	}
+}
+
+// TestProbeSecChUaMatchesTheBrowsers pins the second half of the identity fix.
+// The User-Agent was made coherent between probe and browser, but the probe kept
+// emitting a hardcoded Chrome-110-era Sec-CH-UA — brands in the opposite order to
+// what Chrome sends, and "Not_A Brand";v="24" instead of "Not)A;Brand";v="99".
+// A WAF comparing the two clients saw two different browsers.
+func TestProbeSecChUaMatchesTheBrowsers(t *testing.T) {
+	id := identity{UserAgent: structure.DefaultUserAgent, Major: "150", Full: "150.0.0.0", Platform: "Windows"}
+
+	req, _ := http.NewRequest("GET", "https://example.test", nil)
+	setBrowserHeaders(req, id)
+	probe := req.Header.Get("Sec-Ch-Ua")
+
+	// Rebuild what Chrome is told to report, from the same metadata.
+	var browser []string
+	for _, b := range id.metadata().Brands {
+		browser = append(browser, `"`+b.Brand+`";v="`+b.Version+`"`)
+	}
+	want := strings.Join(browser, ", ")
+
+	if probe != want {
+		t.Errorf("probe and browser disagree on Sec-CH-UA:\n  probe   = %s\n  browser = %s", probe, want)
+	}
+	if strings.Contains(probe, "Not_A Brand") {
+		t.Errorf("probe still sends the stale Chrome-110 brand spelling: %s", probe)
+	}
+	if got := req.Header.Get("Sec-Ch-Ua-Platform"); got != `"Windows"` {
+		t.Errorf("Sec-CH-UA-Platform = %q, want it from the identity", got)
 	}
 }
 

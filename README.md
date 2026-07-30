@@ -90,9 +90,20 @@ wappaGo presents one consistent browser identity to every host it scans. The
 User-Agent is read from the installed Chrome at startup (with the
 `HeadlessChrome` token rewritten) and installed together with its matching
 Client Hints metadata, so `navigator.userAgent`, `navigator.userAgentData` and
-the `Sec-CH-UA-*` headers all report the same build. The raw HTTP probe sends
-the same User-Agent, `Accept` and `Accept-Language`. `--enable-automation` is not
-passed, and WebGL is left enabled.
+the `Sec-CH-UA-*` headers all report the same build. The raw HTTP probe derives
+its `User-Agent`, `Sec-CH-UA-*`, `Accept` and `Accept-Language` from that same
+identity. `--enable-automation` is not passed, and WebGL is left enabled.
+
+That identity is capped to the Chrome version the TLS handshake below can
+actually imitate. uTLS ships no profile for the newest Chrome releases, and
+claiming a browser newer than the handshake produces is a contradiction
+bot-protection vendors correlate: against a DataDome-protected origin, a Chrome
+133 handshake paired with a User-Agent claiming Chrome 150 was refused 4/4 with
+`403` and a captcha page, while the same handshake with a matching User-Agent
+passed 2/2. The cost is that the browser reports an older version than its own
+engine, which a site could catch by comparing the User-Agent against JS features
+only present in the real build — a rarer and more expensive check than the
+TLS/User-Agent correlation, and claiming *older* is the safe direction.
 
 A measurement harness records what the browser actually gives away:
 

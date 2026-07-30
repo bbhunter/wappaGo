@@ -22,10 +22,25 @@ import (
 // whichever protocol ALPN settled on, so the HTTP/2 SETTINGS/WINDOW_UPDATE
 // fingerprint comes from x/net/http2 rather than from a downgrade to HTTP/1.1.
 //
-// chromeHello tracks the newest profile the uTLS build knows about, which is the
-// right default: pinning an old Chrome would itself be a mismatch with the
-// User-Agent resolved from the installed browser.
-var chromeHello = utls.HelloChrome_Auto
+// chromeHello is pinned rather than set to HelloChrome_Auto.
+//
+// Auto is an alias for whatever the uTLS build considers newest (133 in v1.8.2),
+// so a dependency bump silently changes the handshake this tool presents. That
+// matters because the handshake and the claimed User-Agent are correlated by
+// bot-protection vendors: measured against a DataDome-protected origin, the
+// 133 hello paired with a User-Agent claiming Chrome 150 was refused 4/4 with
+// HTTP 403 and a captcha page, while the same hello paired with a matching
+// Chrome 133 User-Agent passed 2/2. Which profile ships is therefore a decision
+// to make deliberately and to keep in step with helloChromeMajor below.
+var chromeHello = utls.HelloChrome_133
+
+// helloChromeMajor is the Chrome major version chromeHello imitates.
+//
+// The identity presented to a host is capped to this, because claiming a browser
+// newer than the handshake we can actually produce is an inconsistency we create
+// ourselves. uTLS has no profile for Chrome 150, so a scanner running on a newer
+// Chrome presents this version instead of its own.
+const helloChromeMajor = "133"
 
 // stealthTransport is a RoundTripper that gives every request a browser-shaped
 // TLS handshake.

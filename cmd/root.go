@@ -347,7 +347,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 	if port != "80" {
 		c.throttle.wait(urlData)
 		request, _ := http.NewRequest("GET", "https://"+urlDataPort, nil)
-		setBrowserHeaders(request, c.userAgent())
+		setBrowserHeaders(request, c.probeIdentity())
 		resp, errSSL = Do(request, client)
 	}
 	if errSSL != nil || port == "80" {
@@ -356,7 +356,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 		} else {
 			c.throttle.wait(urlData)
 			request, _ := http.NewRequest("GET", "http://"+urlDataPort, nil)
-			setBrowserHeaders(request, c.userAgent())
+			setBrowserHeaders(request, c.probeIdentity())
 			resp, errPlain := Do(request, client)
 			if errPlain != nil || resp == nil {
 
@@ -585,27 +585,39 @@ func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) 
 	return true
 }
 
-// userAgent returns the User-Agent presented to scanned hosts. Once Start has
-// read the real browser build this is that build's UA; before then (or if the
-// browser could not be queried) it is the explicit -user-agent, then the
-// built-in fallback.
-func (c *Cmd) userAgent() string {
-	if c.identity.UserAgent != "" {
-		return c.identity.UserAgent
+// probeIdentity is the identity the raw HTTP probe presents. It is the same one
+// the browser gets; when Start has not resolved it yet (library callers, tests)
+// it falls back to the built-in one so the header set stays self-consistent
+// rather than half-filled.
+func (c *Cmd) probeIdentity() identity {
+	id := c.identity
+	if id.UserAgent == "" {
+		id = fallbackIdentity()
 	}
 	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
-		return *c.Options.UserAgent
+		id.UserAgent = *c.Options.UserAgent
+		// An operator-supplied UA drives the Client Hints too, so the two cannot
+		// end up describing different browsers.
+		if major := chromeMajor(id.UserAgent); major != "" {
+			id.Major = major
+			if full := versionAfter(id.UserAgent, "Chrome/"); full != "" {
+				id.Full = full
+			}
+		}
 	}
-	return structure.DefaultUserAgent
+	if id.Platform == "" {
+		id.Platform = "Windows"
+	}
+	return id
 }
 
 // setBrowserHeaders makes the raw HTTP probe look like the same Chrome that
 // drives the rendering pass, so a WAF sees one consistent browser instead of
 // the default "Go-http-client/1.1". Accept-Encoding is left unset on purpose so
 // Go keeps decompressing gzip transparently.
-func setBrowserHeaders(req *http.Request, ua string) {
+func setBrowserHeaders(req *http.Request, id identity) {
 	h := req.Header
-	h.Set("User-Agent", ua)
+	h.Set("User-Agent", id.UserAgent)
 	// Byte-for-byte what Chrome 1xx sends on a document navigation. The probe
 	// used to omit the signed-exchange entry and to hardcode a language Chrome
 	// itself did not use, so the two clients disagreed on every host.
@@ -616,10 +628,12 @@ func setBrowserHeaders(req *http.Request, ua string) {
 	h.Set("Sec-Fetch-Mode", "navigate")
 	h.Set("Sec-Fetch-Site", "none")
 	h.Set("Sec-Fetch-User", "?1")
-	if v := chromeMajor(ua); v != "" {
-		h.Set("Sec-Ch-Ua", `"Google Chrome";v="`+v+`", "Chromium";v="`+v+`", "Not_A Brand";v="24"`)
+	// Derived from the same identity the browser is given, so the probe and
+	// Chrome cannot disagree on the brands, their order or the version.
+	if id.Major != "" {
+		h.Set("Sec-Ch-Ua", id.secChUa())
 		h.Set("Sec-Ch-Ua-Mobile", "?0")
-		h.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+		h.Set("Sec-Ch-Ua-Platform", `"`+id.Platform+`"`)
 	}
 }
 

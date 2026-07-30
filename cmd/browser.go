@@ -182,6 +182,7 @@ func identityFromUserAgent(ua, product string) identity {
 	if major := chromeMajor(ua); major != "" {
 		id.Major = major
 	}
+	id.capToHello()
 	if strings.Contains(ua, "Windows") {
 		id.Platform = "Windows"
 	} else if strings.Contains(ua, "Mac OS X") {
@@ -190,6 +191,44 @@ func identityFromUserAgent(ua, product string) identity {
 		id.Platform = "Linux"
 	}
 	return id
+}
+
+// capToHello lowers the presented version to the one the TLS handshake imitates.
+//
+// The probe's ClientHello comes from a uTLS profile, and uTLS has no profile for
+// the newest Chrome releases. Presenting the installed browser's version while
+// handshaking as an older one is a contradiction we introduce ourselves, and it
+// is the kind bot-protection vendors correlate: against a DataDome origin the
+// mismatched pair was refused 4/4 while the matched pair passed 2/2.
+//
+// The trade-off, stated plainly: the browser then claims to be older than its own
+// engine, so a site comparing the User-Agent against JS features only present in
+// the real build could notice. That check is far rarer and more expensive than the
+// TLS/User-Agent correlation, and claiming an older version is the safe direction
+// — claiming a version newer than the latest stable release is what detectors
+// actually flag. Capping only the probe was the alternative, and it was rejected
+// because it puts the probe and the browser back in disagreement, which is the
+// defect this whole line of work started from.
+func (id *identity) capToHello() {
+	if id.Major == "" || helloChromeMajor == "" {
+		return
+	}
+	have, err1 := strconv.Atoi(id.Major)
+	cap, err2 := strconv.Atoi(helloChromeMajor)
+	if err1 != nil || err2 != nil || have <= cap {
+		return
+	}
+	id.Major = helloChromeMajor
+	id.Full = helloChromeMajor + ".0.0.0"
+	// Rewrite the version inside the UA string so every surface agrees.
+	if i := strings.Index(id.UserAgent, "Chrome/"); i >= 0 {
+		rest := id.UserAgent[i+len("Chrome/"):]
+		end := 0
+		for end < len(rest) && (rest[end] == '.' || (rest[end] >= '0' && rest[end] <= '9')) {
+			end++
+		}
+		id.UserAgent = id.UserAgent[:i] + "Chrome/" + id.Full + rest[end:]
+	}
 }
 
 // fallbackIdentity is used only when the browser cannot be queried. It is a
@@ -279,6 +318,22 @@ func applyIdentity(id identity) chromedp.Action {
 		// bought nothing. The zero outer dimensions are a documented residual.
 		return nil
 	})
+}
+
+// secChUa renders the identity as a Sec-CH-UA header value, in the same brand
+// order and with the same bogus entry the browser itself sends.
+//
+// The raw probe used to hardcode `"Google Chrome";v="N", "Chromium";v="N",
+// "Not_A Brand";v="24"` — the Chrome-110-era spelling, with the brands in the
+// opposite order to what Chrome now emits. So after commit "one coherent browser
+// identity" the User-Agent finally agreed between the probe and the browser while
+// the Client Hints still contradicted each other. Both now come from here.
+func (id identity) secChUa() string {
+	parts := make([]string, 0, len(id.metadata().Brands))
+	for _, b := range id.metadata().Brands {
+		parts = append(parts, `"`+b.Brand+`";v="`+b.Version+`"`)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // metadata mirrors what a real Chrome of this version reports, including the
