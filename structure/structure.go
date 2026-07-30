@@ -70,6 +70,12 @@ type Options struct {
 	Rps            *float64
 	Jitter         *int
 	NoProgress     *bool
+	// Headless runs Chrome without a display. It defaults to false: headless
+	// reports an 800x600 screen whatever the window size and writes
+	// "HeadlessChrome" into its own User-Agent, both of which have to be papered
+	// over. Running with a real display (Xvfb on a server) avoids that entirely.
+	// Requires a display to be available — see the note in cmd.Start.
+	Headless *bool
 }
 
 // Default values for Options. They are the single source of truth: main.go
@@ -127,7 +133,7 @@ func (o *Options) ApplyDefaults() {
 			*p = &v
 		}
 	}
-	for _, p := range []**bool{&o.AmassInput, &o.FollowRedirect, &o.Report, &o.NoProgress} {
+	for _, p := range []**bool{&o.AmassInput, &o.FollowRedirect, &o.Report, &o.NoProgress, &o.Headless} {
 		flag(p)
 	}
 	if o.ChromeTimeout == nil {
@@ -166,6 +172,9 @@ type WrapperOptions struct {
 	UserAgent      string
 	Rps            float64
 	Jitter         int
+	// Headless runs Chrome without a display. Default false; requires a display
+	// (Xvfb on a server) when left off.
+	Headless bool
 }
 
 // Response is the raw HTTP probe result. It only carries what is actually

@@ -48,6 +48,9 @@ Usage of wappaGo:
         Number of chromes threads in each main threads total = option.threads*option.chrome-threads (Default 5) (default 5)
   -follow-redirect
         Follow redirect to detect technologie
+  -headless
+        Run Chrome without a display. Off by default: headless fakes an 800x600
+        screen and brands its own User-Agent. Use xvfb-run on a server instead
   -jitter int
         Max random delay in ms added before each request (0 = none)
   -no-progress
@@ -94,6 +97,31 @@ the `Sec-CH-UA-*` headers all report the same build. The raw HTTP probe derives
 its `User-Agent`, `Sec-CH-UA-*`, `Accept` and `Accept-Language` from that same
 identity. `--enable-automation` is not passed, and WebGL is left enabled.
 
+**Chrome runs with a display by default.** Headless is available behind
+`-headless`, but it costs two things that then have to be papered over: it reports
+an 800x600 screen whatever the window size, so a 1400x900 viewport claims to sit
+on a smaller display, and it brands its own User-Agent. With a real display both
+are simply correct — measured `screen=1920x1200` and a clean UA — and no screen
+override is issued at all. On a server, run it under a virtual display:
+
+```bash
+xvfb-run -a --server-args="-screen 0 1920x1080x24" ./wappaGo < domain.txt
+```
+
+Without a display and without `-headless`, Chrome will not start; wappaGo says so
+and points at both options rather than failing with a bare error.
+
+`RTCPeerConnection` leaks the host's real public address when `-proxy` is in use:
+WebRTC negotiates over UDP and does not traverse an HTTP proxy, so a scanned page
+can reach a public STUN server and read straight past the proxy. That is
+deanonymisation rather than fingerprinting, so `-proxy` also enables
+`--webrtc-ip-handling-policy=disable_non_proxied_udp`, which drops both the
+server-reflexive and host candidates while leaving `RTCPeerConnection` defined —
+closing the leak without substituting a "browser with no WebRTC" tell. Chrome
+already hides the LAN address behind an mDNS name by default. The
+`--force-webrtc-ip-handling-policy` spelling was measured to have no effect at all
+on Chrome 150; only the older flag name works.
+
 That identity is capped to the Chrome version the TLS handshake below can
 actually imitate. uTLS ships no profile for the newest Chrome releases, and
 claiming a browser newer than the handshake produces is a contradiction
@@ -111,19 +139,33 @@ A measurement harness records what the browser actually gives away:
 WAPPAGO_STEALTH_CHECK=1 go test ./cmd/ -run Stealth -v
 ```
 
-It serves its own page locally, so the verdicts are reproducible. Two known
-limits it reports rather than hides:
+It serves its own page locally, so the verdicts are reproducible, and it also
+drives the hosted detector at `bot-detector.rebrowser.net`:
 
-- **`window.outerWidth` / `outerHeight` are 0.** Headless Chrome has no real
-  window and no CDP call changes this. The usual workaround redefines the
-  accessor from an injected script, which leaves a getter that no longer reports
-  `[native code]` — a broader tell than the one it fixes, so it is not done.
-- **WebGL quality depends on the host.** On a machine with a GPU, Chrome reports
-  the real adapter, which is the most plausible fingerprint available. On a
-  GPU-less server or container it falls back to software rendering and the
-  renderer string says so (`SwiftShader`, `Microsoft Basic Render Driver`,
-  `llvmpipe`). The harness logs a `NOTE:` when that happens. Running with a GPU,
-  or with a virtual display, gives a stronger identity.
+```bash
+WAPPAGO_STEALTH_REMOTE=1 go test ./cmd/ -run RemoteDetector -v
+```
+
+Two known limits it reports rather than hides:
+
+- **`window.outerWidth` / `outerHeight` are 0.** This comes from the tab chromedp
+  attaches to through `Target.createTarget`, which has no window of its own —
+  not from headless, and not from the metrics override. Measured: every
+  combination of headless/display, override/no override and
+  `Browser.setWindowBounds` reports 0, while raw Chrome opening a URL itself
+  reports the window size. Nothing reachable over CDP changes it, and the usual
+  workaround redefines the accessor from an injected script, which leaves a getter
+  that no longer reports `[native code]` — a broader tell than the one it fixes.
+- **WebGL quality depends on the host.** With a GPU, Chrome reports the real
+  adapter, the most plausible fingerprint available. On a GPU-less server it falls
+  back to software rendering and says so (`SwiftShader`, `llvmpipe`,
+  `Microsoft Basic Render Driver`), and the canvas hash shifts with it — a stable
+  value that is a *known* value is still identifying. There is no CDP override for
+  WebGL, so masking it would mean patching JS. Measured against the hosted
+  detector, forcing SwiftShader changed no verdict at all: the same greens as a
+  real GPU. That is a negative result from one detector rather than proof of
+  safety — CreepJS and commercial vendors do fingerprint WebGL — so nothing is
+  patched for now and the harness logs a `NOTE:` when software rendering is in use.
 
 Canvas, WebGL and audio fingerprints are deliberately **not** randomised. The
 goal is to look ordinary, not unique: a fingerprint that changes between two
@@ -185,6 +227,7 @@ type WrapperOptions struct {
 	UserAgent      string
 	Rps            float64
 	Jitter         int
+	Headless       bool
 }
 ```
 

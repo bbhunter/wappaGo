@@ -306,7 +306,7 @@ func runProbe(t *testing.T) (probeResult, http.Header) {
 
 	var raw []byte
 	err = chromedp.Run(ctx,
-		applyIdentity(ident),
+		applyIdentity(ident, false),
 		chromedp.Navigate(srv.URL),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			return chromedp.Evaluate(`JSON.stringify(window.__probe)`, &raw).Do(ctx)
@@ -392,15 +392,21 @@ func TestStealthReport(t *testing.T) {
 		t.Logf("  webgl                   UNAVAILABLE %s", res.WebGL.Error)
 	}
 
-	// Known residual, reported rather than hidden: headless Chrome has no real
-	// window, so window.outerWidth/outerHeight are 0 and neither
-	// Emulation.setDeviceMetricsOverride nor Browser.setWindowBounds changes
-	// that. The only known workaround is redefining the accessor from an
-	// injected script, which leaves a getter that no longer reports
-	// [native code] — trading a narrow leak for a broader one. Left alone
-	// deliberately; revisit only with a measurement showing it matters.
+	// Known residual, reported rather than hidden. It comes from the tab chromedp
+	// attaches to via Target.createTarget, which has no window of its own — not
+	// from headless, and not from the metrics override, both of which were blamed
+	// here before and measured innocent:
+	//
+	//   headless, no override      outer=0x0     display, no override      outer=0x0
+	//   headless, override         outer=0x0     display, override         outer=0x0
+	//   headless + windowBounds    outer=0x0     display + windowBounds    outer=0x0
+	//
+	// Raw Chrome opening a URL itself does report the window size, so nothing
+	// reachable over CDP fixes this. The usual workaround redefines the accessor
+	// from an injected script, which leaves a getter that no longer reports
+	// [native code] — a broader tell than the one it fixes.
 	if res.OuterWidth == 0 || res.OuterHeight == 0 {
-		t.Logf("  RESIDUAL: window.outerWidth/outerHeight are 0 (inherent to headless, not patched on purpose)")
+		t.Logf("  RESIDUAL: window.outerWidth/outerHeight are 0 (chromedp target has no window; not patched on purpose)")
 	}
 
 	t.Log("=== on the wire ===")
@@ -488,6 +494,135 @@ func TestStealthWebGLAvailable(t *testing.T) {
 	}
 }
 
+// webrtcProbe reports its ICE candidates back to the test server rather than
+// leaving them in the DOM.
+//
+// ICE gathering is asynchronous and chromedp.Evaluate returns immediately, so
+// reading window state would only ever catch "pending" — the page has to push the
+// result once gathering completes.
+const webrtcProbe = `<!doctype html><html><body><script>
+var lines = [], sent = false;
+function send(tag) {
+  if (sent) return;
+  sent = true;
+  fetch('/report', {method: 'POST', body: JSON.stringify({tag: tag, candidates: lines})});
+}
+if (typeof RTCPeerConnection === 'undefined') { send('NO_API'); }
+else {
+  var pc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+  pc.onicecandidate = function (e) {
+    if (e.candidate) { lines.push(e.candidate.candidate); } else { send('COMPLETE'); }
+  };
+  pc.createDataChannel('probe');
+  pc.createOffer().then(function (o) { return pc.setLocalDescription(o); })
+    .catch(function () { send('OFFER_ERROR'); });
+  setTimeout(function () { send('TIMEOUT'); }, 8000);
+}
+</script></body></html>`
+
+type webrtcResult struct {
+	Tag        string   `json:"tag"`
+	Candidates []string `json:"candidates"`
+}
+
+// runWebrtcProbe drives the production configuration at the WebRTC page and
+// returns what the page managed to gather. proxy mirrors -proxy, which is what
+// gates the mitigation.
+func runWebrtcProbe(t *testing.T, proxy string) webrtcResult {
+	t.Helper()
+
+	var mu sync.Mutex
+	var got *webrtcResult
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var res webrtcResult
+			if err := json.NewDecoder(r.Body).Decode(&res); err == nil {
+				mu.Lock()
+				if got == nil {
+					got = &res
+				}
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(webrtcProbe))
+	}))
+	defer srv.Close()
+
+	opts := structure.Options{Proxy: &proxy}
+	opts.ApplyDefaults()
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(),
+		chromeAllocatorOptions(opts, "")...)
+	defer cancelAlloc()
+	browserCtx, cancelBrowser := chromedp.NewContext(allocCtx)
+	defer cancelBrowser()
+	ctx, cancel := context.WithTimeout(browserCtx, 90*time.Second)
+	defer cancel()
+
+	if err := chromedp.Run(ctx, chromedp.Navigate(srv.URL), chromedp.Sleep(10*time.Second)); err != nil {
+		t.Fatalf("webrtc probe run: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got == nil {
+		t.Fatal("the page never reported its ICE candidates")
+	}
+	return *got
+}
+
+// TestStealthWebRTCDoesNotLeakTheHostAddress is the regression guard for a leak
+// that is not fingerprinting but deanonymisation: WebRTC negotiates over UDP and
+// does not traverse an HTTP proxy, so a scanned page could open an
+// RTCPeerConnection to a public STUN server and read the scanner's real public
+// address straight past -proxy.
+//
+// The mitigation is gated on -proxy, so that is what this asserts. Note the flag
+// name is the older --webrtc-ip-handling-policy; the --force- spelling was
+// measured to have no effect at all on Chrome 150.
+func TestStealthWebRTCDoesNotLeakTheHostAddress(t *testing.T) {
+	requireStealthCheck(t)
+
+	res := runWebrtcProbe(t, "http://127.0.0.1:1")
+	t.Logf("with -proxy: tag=%s, %d candidate(s)", res.Tag, len(res.Candidates))
+	for _, c := range res.Candidates {
+		t.Logf("    %s", c)
+	}
+	if res.Tag == "NO_API" {
+		t.Error("RTCPeerConnection is gone entirely: the leak is closed, but a browser " +
+			"without WebRTC is itself unusual — the flag should keep the API present")
+	}
+	for _, c := range res.Candidates {
+		if strings.Contains(c, "typ srflx") {
+			t.Errorf("server-reflexive candidate leaked the host's public address past the proxy: %s", c)
+		}
+		if strings.Contains(c, "typ host") {
+			t.Errorf("host candidate leaked past the proxy: %s", c)
+		}
+	}
+
+	// Without -proxy the mitigation is deliberately not applied, on the grounds
+	// that the scanned host sees the real address anyway. Recording it here keeps
+	// that decision visible and, just as importantly, proves the probe above is
+	// capable of observing a leak — a test that can only ever pass is worthless.
+	bare := runWebrtcProbe(t, "")
+	leaked := 0
+	for _, c := range bare.Candidates {
+		if strings.Contains(c, "typ srflx") {
+			leaked++
+		}
+	}
+	t.Logf("without -proxy (mitigation deliberately off): tag=%s, %d candidate(s), %d server-reflexive",
+		bare.Tag, len(bare.Candidates), leaked)
+	if leaked == 0 {
+		t.Log("NOTE: no leak observed without -proxy either. Either the network blocks STUN or Chrome " +
+			"changed its default — if the latter, the proxy gating is no longer load-bearing and this " +
+			"test has stopped proving anything.")
+	}
+}
+
 // TestStealthRemoteDetector runs the shipping configuration against
 // rebrowser's hosted detector, which checks things a local page cannot observe —
 // above all the Runtime.enable CDP leak.
@@ -523,7 +658,7 @@ func TestStealthRemoteDetector(t *testing.T) {
 
 	var raw []byte
 	if err := chromedp.Run(ctx,
-		applyIdentity(ident),
+		applyIdentity(ident, false),
 		chromedp.Navigate("https://bot-detector.rebrowser.net/"),
 		// The page runs its checks on load; the last one is a network call.
 		chromedp.Sleep(8*time.Second),

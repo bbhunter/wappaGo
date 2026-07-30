@@ -77,6 +77,7 @@ func configureOptions(wrapperOptions structure.WrapperOptions) (*cmd.Cmd, error)
 		Rps:            &wrapperOptions.Rps,
 		Jitter:         &wrapperOptions.Jitter,
 		NoProgress:     &noProgress, // library mode: no stderr progress bar
+		Headless:       &wrapperOptions.Headless,
 	}
 	// A zero-valued WrapperOptions used to reach cmd with Threads=0 and
 	// Porttimeout=0 — including in the README's own example.

@@ -28,6 +28,7 @@ import (
 	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/goccy/go-json"
 	"github.com/projectdiscovery/cdncheck"
@@ -162,6 +163,13 @@ func (c *Cmd) Start(results chan structure.Data) {
 		// results channel is closed so the consumer drains and exits cleanly,
 		// rather than panicking and skipping cleanup.
 		fmt.Fprintf(os.Stderr, "could not start Chrome: %v\n", err)
+		if !*c.Options.Headless {
+			// A real display is the default now, so this is the likely cause on a
+			// server and the bare error would not say so.
+			fmt.Fprintln(os.Stderr, "hint: Chrome runs with a display by default. On a headless server, "+
+				"wrap the command in xvfb-run, or pass -headless (which fakes an 800x600 screen "+
+				"and brands the User-Agent).")
+		}
 		close(results)
 		return
 	}
@@ -434,9 +442,27 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 
 	c.throttle.wait(data.Infos.Data)
 	err = chromedp.Run(cloneCTX,
+		// Close the Runtime.enable CDP leak before anything loads.
+		//
+		// chromedp calls runtime.Enable() once when it attaches to the tab
+		// (chromedp@v0.16.0/chromedp.go:445), and a page can observe that the
+		// domain is enabled — the most widely cited CDP detection method.
+		// Disabling it again costs nothing here: enable only controls *events*,
+		// while Runtime.evaluate is a command that works either way, so all 3155
+		// js patterns keep running in the main world, which they require.
+		//
+		// The one thing this gives up is chromedp's execution-context tracking
+		// (Target.execContexts), read only by its selector-based actions —
+		// WaitVisible, Nodes, Query, Poll and friends. wappaGo uses none of them:
+		// the complete list is Evaluate, Navigate, Title, CaptureScreenshot,
+		// Sleep, ActionFunc and ListenTarget, and Title is itself an
+		// EvaluateAsDevTools. Adding a selector action later means removing this.
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return runtime.Disable().Do(ctx)
+		}),
 		// Install the User-Agent and its matching Client Hints before the first
 		// navigation, so the very first request carries a consistent identity.
-		applyIdentity(c.identity),
+		applyIdentity(c.identity, *c.Options.Headless),
 		chromedp.Navigate(urlData),
 		chromedp.Title(&data.Infos.Title),
 		// The screenshot is optional and must never be able to cost a detection.

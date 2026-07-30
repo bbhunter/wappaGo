@@ -31,6 +31,7 @@ func main() {
 	options.Rps = flag.Float64("rps", 0, "Max HTTP requests per second per host to stay under rate-based WAF rules (0 = unlimited)")
 	options.Jitter = flag.Int("jitter", 0, "Max random delay in ms added before each request (0 = none)")
 	options.NoProgress = flag.Bool("no-progress", false, "Disable the stderr progress bar")
+	options.Headless = flag.Bool("headless", false, "Run Chrome without a display. Off by default: headless fakes an 800x600 screen and brands its own User-Agent. Needs a display otherwise (use xvfb-run on a server)")
 	flag.Parse()
 	configure(options)
 }

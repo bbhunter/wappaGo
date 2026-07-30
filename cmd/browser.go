@@ -72,7 +72,25 @@ func chromeAllocatorOptions(options structure.Options, userAgent string) []chrom
 
 		chromedp.Flag("force-color-profile", "srgb"),
 		chromedp.WindowSize(viewportWidth, viewportHeight),
-		chromedp.Headless,
+	}
+
+	// Headless is opt-in, not the default. It costs two things that then have to
+	// be papered over: Chrome reports an 800x600 screen whatever the window size
+	// (so a 1400x900 viewport claims to sit on a smaller display), and it writes
+	// "HeadlessChrome" into its own User-Agent. With a real display — Xvfb on a
+	// server — the screen is genuine and the UA is clean, measured:
+	//
+	//   chromedp headless, no override   screen=800x600     UA contains Headless
+	//   chromedp with a display          screen=1920x1200   UA clean
+	//
+	// The cost is a display being required; cmd.Start turns the resulting launch
+	// failure into an actionable message rather than a bare "could not start".
+	if options.Headless != nil && *options.Headless {
+		opts = append(opts, chromedp.Headless)
+	} else {
+		// Keep the window off-screen so an interactive desktop is not flooded
+		// with browser windows during a scan.
+		opts = append(opts, chromedp.Flag("window-position", "-32000,-32000"))
 	}
 
 	// Notable omissions, each one a measured decision:
@@ -102,6 +120,33 @@ func chromeAllocatorOptions(options structure.Options, userAgent string) []chrom
 	}
 	if options.Proxy != nil && *options.Proxy != "" {
 		opts = append(opts, chromedp.ProxyServer(*options.Proxy))
+		// Close the WebRTC IP leak, which matters precisely when a proxy is in
+		// use: WebRTC negotiates over UDP and does not traverse an HTTP proxy, so
+		// a scanned page could open an RTCPeerConnection to a public STUN server
+		// and read the host's real public address straight past the proxy. That is
+		// deanonymisation, not fingerprinting.
+		//
+		// The flag name matters and is counter-intuitive. Measured on Chrome 150,
+		// one page per row, reproduced twice:
+		//
+		//   (none)                                            host=1 srflx=1
+		//   --force-webrtc-ip-handling-policy=disable_non_proxied_udp
+		//                                                     host=1 srflx=1
+		//   --force-webrtc-ip-handling-policy=default_public_interface_only
+		//                                                     host=1 srflx=1
+		//   --webrtc-ip-handling-policy=default_public_interface_only
+		//                                                     host=0 srflx=1
+		//   --webrtc-ip-handling-policy=disable_non_proxied_udp
+		//                                                     host=0 srflx=0
+		//
+		// So the modern-looking `--force-` spelling does nothing here, and only
+		// the older name closes it. Do not "modernise" this without re-measuring.
+		//
+		// RTCPeerConnection stays defined either way, so the leak is closed
+		// without creating a "browser with no WebRTC" tell in its place. Chrome
+		// already hides the LAN address behind an mDNS name by default, so the
+		// public address was the only one exposed.
+		opts = append(opts, chromedp.Flag("webrtc-ip-handling-policy", "disable_non_proxied_udp"))
 	}
 	return opts
 }
@@ -288,9 +333,15 @@ func captureScreenshot(enabled bool, buf *[]byte) chromedp.Action {
 
 // applyIdentity installs the identity on a target: the User-Agent together with
 // the Client Hints metadata, so navigator.userAgent, navigator.userAgentData and
-// the Sec-CH-UA-* headers all agree; a viewport that fits inside a plausible
-// screen; and a locale matching the Accept-Language the probe sends.
-func applyIdentity(id identity) chromedp.Action {
+// the Sec-CH-UA-* headers all agree, and a locale matching the Accept-Language
+// the probe sends.
+//
+// headless selects whether the screen has to be faked. With a real display the
+// screen is genuine, so no metrics override is issued at all — one fewer CDP call
+// and one fewer emulated surface. Under -headless Chrome insists on 800x600
+// regardless of the window, which would put a 1400x900 viewport on a smaller
+// display, so the override is applied to compensate.
+func applyIdentity(id identity, headless bool) chromedp.Action {
 	return chromedp.ActionFunc(func(ctx context.Context) error {
 		if id.UserAgent != "" {
 			if err := emulation.SetUserAgentOverride(id.UserAgent).
@@ -300,22 +351,33 @@ func applyIdentity(id identity) chromedp.Action {
 				return err
 			}
 		}
-		// Declare the screen the viewport lives on, so screen.width/height stop
-		// reporting the headless 800x600 default.
-		if err := emulation.SetDeviceMetricsOverride(viewportWidth, viewportHeight, 1, false).
-			WithScreenWidth(screenWidth).
-			WithScreenHeight(screenHeight).
-			WithPositionX(0).
-			WithPositionY(0).
-			Do(ctx); err != nil {
-			return err
+		if headless {
+			if err := emulation.SetDeviceMetricsOverride(viewportWidth, viewportHeight, 1, false).
+				WithScreenWidth(screenWidth).
+				WithScreenHeight(screenHeight).
+				WithPositionX(0).
+				WithPositionY(0).
+				Do(ctx); err != nil {
+				return err
+			}
 		}
-		// Browser.setWindowBounds was tried here to give
-		// window.outerWidth/outerHeight a non-zero value. The harness measured no
-		// effect — headless has no real window — and it made
-		// Page.captureScreenshot fail with -32000 on heavy pages, which took the
-		// whole detection pass down with it. Removed: it cost detections and
-		// bought nothing. The zero outer dimensions are a documented residual.
+		// window.outerWidth/outerHeight stay 0. This is a documented residual, and
+		// the earlier explanations for it in this file were both wrong: it is not
+		// caused by headless, and not by the metrics override either. Measured
+		// through chromedp, every combination reports 0:
+		//
+		//   headless, no override           outer=0x0  screen=800x600
+		//   headless, override               outer=0x0  screen=1920x1080
+		//   headless + setWindowBounds       outer=0x0
+		//   display, no override             outer=0x0  screen=1920x1200
+		//   display + setWindowBounds        outer=0x0
+		//
+		// Raw Chrome opening a URL itself does report 1400x900, so the zero comes
+		// from the tab chromedp attaches to via Target.createTarget, which has no
+		// window of its own. Nothing reachable over CDP changes it, and the usual
+		// workaround — redefining the accessor from an injected script — leaves a
+		// getter that no longer reports [native code], a broader tell than the one
+		// it fixes.
 		return nil
 	})
 }
