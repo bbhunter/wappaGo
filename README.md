@@ -119,6 +119,29 @@ goal is to look ordinary, not unique: a fingerprint that changes between two
 reads is itself a signature of an anti-fingerprinting tool. The harness asserts
 those surfaces are present and stable instead.
 
+The raw HTTP probe also handshakes like a browser. It runs before Chrome on every
+target, so its TLS ClientHello is the first thing a host sees, and Go's
+`crypto/tls` hello does not resemble one: different cipher list and ordering, and
+no ALPN at all — which is what JA3/JA4 hashes key on. The probe now dials https
+through [uTLS](https://github.com/refraction-networking/utls) with a Chrome
+ClientHello, and carries the request over HTTP/2 when ALPN settles on it, so the
+HTTP/2 `SETTINGS`/`WINDOW_UPDATE` fingerprint is a real h2 client's rather than a
+downgrade to HTTP/1.1. Measured against a local server:
+
+| | cipher suites | first suite | ALPN offered |
+|---|---|---|---|
+| `crypto/tls` | 13 | `0xc02b` | *(none)* |
+| uTLS Chrome | 16 | `0x5a5a` (GREASE) | `h2`, `http/1.1` |
+
+Two cases keep the standard transport on purpose: plain `http`, which has no
+handshake to disguise, and `-proxy`, where the origin handshake happens inside a
+`CONNECT` tunnel wappaGo does not drive.
+
+Still outstanding: `chromedp` issues `Runtime.enable` on every target, which is
+a reliable CDP detection signal. The usual fix routes evaluation through an
+isolated world, but wappaGo's `js` fingerprints read page globals
+(`jQuery.fn.jquery`, `Stimulus.Application`) and so require the main world.
+
 You can either use wappaGo from a file containing a list of domains
 ```bash
 cat domain.txt | ./wappaGo

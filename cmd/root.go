@@ -715,24 +715,24 @@ func (c *Cmd) InitDialer() (*fastdialer.Dialer, error) {
 // transport) is never mutated afterwards, so it is safe to share across all
 // target/port goroutines.
 func (c *Cmd) buildHTTPClient() *http.Client {
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DialContext:       c.Dialer.Dial,
-		DisableKeepAlives: true,
-	}
+	// A proxy tunnels the origin handshake through CONNECT, so the ClientHello
+	// is not ours to shape; that path keeps the standard transport. The
+	// MaxVersion pin that used to be here as well has been dropped: capping the
+	// tunnel at TLS 1.2 hid every TLS-1.3-only origin behind a probe failure.
+	var proxyTransport *http.Transport
 	if *c.Options.Proxy != "" {
-		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-		if parseErr == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-			transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
+		if proxyURL, parseErr := URL.Parse(*c.Options.Proxy); parseErr == nil {
+			proxyTransport = &http.Transport{
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+				DialContext:       c.Dialer.Dial,
+				DisableKeepAlives: true,
+				Proxy:             http.ProxyURL(proxyURL),
+			}
 		}
 	}
 	client := &http.Client{
 		Timeout:   10 * time.Second,
-		Transport: transport,
+		Transport: newHTTPTransport(c.Dialer.Dial, proxyTransport),
 	}
 	if !*c.Options.FollowRedirect {
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
