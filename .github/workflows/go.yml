@@ -1,24 +1,42 @@
 name: Go
 
+# Runs on every branch, not just master: the previous filter meant a feature
+# branch got no CI at all until it opened a PR.
 on:
   push:
-    branches: [ master ]
   pull_request:
-    branches: [ master ]
 
 jobs:
 
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Set up Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
       with:
-        go-version: 1.19
+        # Track the version declared in go.mod rather than a second, drifting
+        # copy of it here.
+        go-version-file: go.mod
+        cache: true
+
+    - name: Check formatting
+      run: |
+        unformatted=$(gofmt -l .)
+        if [ -n "$unformatted" ]; then
+          echo "These files are not gofmt'd:"
+          echo "$unformatted"
+          exit 1
+        fi
+
+    - name: Vet
+      run: go vet ./...
 
     - name: Build
       run: go build -v ./...
 
-
+    # The suite was never run in CI, so every detection bug it now guards
+    # against could have been reintroduced silently.
+    - name: Test
+      run: go test -race ./...

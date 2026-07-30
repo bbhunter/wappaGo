@@ -2,24 +2,25 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	URL "net/url"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/EasyRecon/wappaGo/analyze"
-	"github.com/EasyRecon/wappaGo/lib"
 	"github.com/EasyRecon/wappaGo/report"
 	"github.com/EasyRecon/wappaGo/structure"
 	"github.com/EasyRecon/wappaGo/technologies"
@@ -27,11 +28,11 @@ import (
 	"github.com/chromedp/cdproto/dom"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 	"github.com/goccy/go-json"
 	"github.com/projectdiscovery/cdncheck"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
-	pdhttputil "github.com/projectdiscovery/httputil"
 	"github.com/remeh/sizedwaitgroup"
 )
 
@@ -41,38 +42,149 @@ type Cmd struct {
 	ResultGlobal map[string]interface{}
 	Cdn          *cdncheck.Client
 	Options      structure.Options
-	PortOpenByIP []structure.PortOpenByIp
+	// portOpenByIP caches the open ports found for an IP so hosts sharing an
+	// address are scanned once. It replaces a []PortOpenByIp that was linearly
+	// scanned while holding portMu — quadratic, and fully serialised across
+	// every worker (4 s of lock time at 50k hosts).
+	portOpenByIP map[string][]string
+	portMu       sync.RWMutex // guards portOpenByIP
 	HttpClient   *http.Client
 	ResultArray  []structure.Data
+	reportMu     sync.Mutex // guards ResultArray (report mode)
+	throttle     *hostThrottle
 	Input        []string
+	// identity is the browser identity presented to every scanned host, read
+	// from the real Chrome build in Start before any worker starts.
+	identity identity
+	// dns answers the record queries the dns fingerprint family needs. Built
+	// once in Start and read-only afterwards.
+	dns *dnsResolver
+	// sigCtx is cancelled on SIGINT/SIGTERM. It gates the host loop and the
+	// port scanner so Ctrl+C actually stops the scan; previously it only
+	// parented the Chrome allocator, so the first Ctrl+C killed the browser and
+	// left the run grinding through the remaining input emitting empty results.
+	sigCtx context.Context
+}
+
+// interrupted reports whether a shutdown signal has been received.
+func (c *Cmd) interrupted() bool {
+	return c.sigCtx != nil && c.sigCtx.Err() != nil
 }
 
 func (c *Cmd) Start(results chan structure.Data) {
-	c.Dialer = c.InitDialer()
+	// Repair anything unset or nonsensical before a single pointer is
+	// dereferenced. Both entry points go through here, so neither the CLI nor
+	// the library can reach the scan with a nil field or an unbounded
+	// worker count.
+	c.Options.ApplyDefaults()
+	c.portOpenByIP = make(map[string][]string)
+
+	dialer, err := c.InitDialer()
+	if err != nil {
+		// Without a dialer every probe would nil-deref inside an http.Transport
+		// goroutine, where no recover() can reach it.
+		fmt.Fprintf(os.Stderr, "could not create the resolver cache: %v\n", err)
+		close(results)
+		return
+	}
+	c.Dialer = dialer
 	defer c.Dialer.Close()
 
-	optionsChromeCtx := []chromedp.ExecAllocatorOption{}
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.DefaultExecAllocatorOptions[:]...)
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("headless", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-popup-blocking", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.DisableGPU)
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-webgl", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("ignore-certificate-errors", true)) // RIP shittyproxy.go
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.WindowSize(1400, 900))
-	if *c.Options.Proxy != "" {
-		optionsChromeCtx = append(optionsChromeCtx, chromedp.ProxyServer(*c.Options.Proxy))
+	// Resolved explicitly rather than scavenged from the dialer's cache: newer
+	// fastdialer only retains address records, so the dns fingerprints had gone
+	// silent. A failure here is not fatal — the dns family is one signal source
+	// among a dozen — but it is worth reporting.
+	dnsResolver, dnsErr := newDNSResolver(c.resolvers())
+	if dnsErr != nil {
+		fmt.Fprintf(os.Stderr, "could not create the DNS resolver, dns fingerprints disabled: %v\n", dnsErr)
 	}
+	c.dns = dnsResolver
+
+	// Build the HTTP client once, up front: it is read-only for the rest of
+	// the run and shared across all target goroutines. Previously it was
+	// rebuilt per target on the shared c.HttpClient field (a data race), and
+	// the process-global http.DefaultTransport was mutated per request.
+	c.HttpClient = c.buildHTTPClient()
+
+	// Per-host request pacing to stay under rate-based WAF rules (no-op unless
+	// -rps or -jitter is set).
+	c.throttle = newHostThrottle(*c.Options.Rps, *c.Options.Jitter)
+
+	// The User-Agent is left to Chrome at launch: overriding it here with a
+	// hardcoded version contradicted the Sec-CH-UA headers Chrome derives from
+	// its own build (measured: UA said Chrome/131 while Sec-CH-UA said 150).
+	// resolveIdentity below reads the real build and installs a consistent
+	// identity per target instead.
+	optionsChromeCtx := chromeAllocatorOptions(c.Options, "")
+
+	// Tie the browser lifetime to SIGINT/SIGTERM: the first Ctrl+C cancels this
+	// context, which tears Chrome down and lets the deferred cleanup (browser
+	// processes, dialer, temp fingerprint dir) run instead of leaving orphans.
+	// Watch for the signal on an explicit channel rather than via
+	// signal.NotifyContext: that helper's stop function cancels the context
+	// itself, so a normal end-of-scan teardown was indistinguishable from a real
+	// Ctrl+C and printed the interrupt notice on every single run.
+	sigCtx, cancelScan := context.WithCancel(context.Background())
+	defer cancelScan()
+	c.sigCtx = sigCtx
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	scanDone := make(chan struct{})
+	defer close(scanDone)
+	go func() {
+		select {
+		case <-sigCh:
+			fmt.Fprintln(os.Stderr, "\ninterrupted: finishing in-flight hosts, press Ctrl+C again to abort")
+			cancelScan()
+			// Restore the default handler so a second Ctrl+C kills the process.
+			// Previously the first signal disarmed it for the rest of the run,
+			// leaving no way to abort at all.
+			signal.Stop(sigCh)
+		case <-scanDone:
+		}
+	}()
 
 	//ctxAlloc, cancel := chromedp.NewExecAllocator(context.Background(), append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false), chromedp.Flag("disable-gpu", true))...)
-	ctxAlloc, cancel1 := chromedp.NewExecAllocator(context.Background(), optionsChromeCtx...)
+	ctxAlloc, cancel1 := chromedp.NewExecAllocator(sigCtx, optionsChromeCtx...)
 	defer cancel1()
 
 	ctxAlloc1, cancel := chromedp.NewContext(ctxAlloc)
 	c.ChromeCtx = ctxAlloc1
 	defer cancel()
 
+	// Read the real browser build once, up front, and present that same
+	// identity everywhere: the Chrome targets (User-Agent + Client Hints) and
+	// the raw HTTP probe's headers. c.identity is written here, before any
+	// worker exists, and only read afterwards.
 	if err := chromedp.Run(c.ChromeCtx); err != nil {
-		panic(err)
+		// Startup failure (including a cancel during launch) is reported and the
+		// results channel is closed so the consumer drains and exits cleanly,
+		// rather than panicking and skipping cleanup.
+		fmt.Fprintf(os.Stderr, "could not start Chrome: %v\n", err)
+		if !*c.Options.Headless {
+			// A real display is the default now, so this is the likely cause on a
+			// server and the bare error would not say so.
+			fmt.Fprintln(os.Stderr, "hint: Chrome runs with a display by default. On a headless server, "+
+				"wrap the command in xvfb-run, or pass -headless (which fakes an 800x600 screen "+
+				"and brands the User-Agent).")
+		}
+		close(results)
+		return
+	}
+
+	if id, err := resolveIdentity(c.ChromeCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "could not read the browser build, using the fallback identity: %v\n", err)
+		c.identity = id
+	} else {
+		c.identity = id
+	}
+	// An explicit -user-agent still wins, but the Client Hints metadata keeps
+	// following the real build, so the two cannot contradict each other on the
+	// version the way a hardcoded UA did.
+	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
+		c.identity.UserAgent = *c.Options.UserAgent
 	}
 
 	c.Cdn = cdncheck.New()
@@ -81,22 +193,59 @@ func (c *Cmd) Start(results chan structure.Data) {
 	swg := sizedwaitgroup.New(*c.Options.Threads)
 	url = ""
 	ip = ""
+	prog := newProgress(len(c.Input), *c.Options.NoProgress)
 	for _, line := range c.Input {
+		if c.interrupted() {
+			fmt.Fprintf(os.Stderr, "aborted: %d/%d hosts not scanned\n", len(c.Input)-int(prog.processed()), len(c.Input))
+			break
+		}
+		ip = ""
 		if *c.Options.AmassInput {
 			var result map[string]interface{}
-			json.Unmarshal([]byte(line), &result)
-			url = result["name"].(string)
-			ip = result["addresses"].([]interface{})[0].(map[string]interface{})["ip"].(string)
+			if err := json.Unmarshal([]byte(line), &result); err != nil {
+				fmt.Fprintf(os.Stderr, "skip amass line: %v\n", err)
+				prog.inc()
+				continue
+			}
+			name, ok := result["name"].(string)
+			if !ok {
+				fmt.Fprintf(os.Stderr, "skip amass line: missing name\n")
+				prog.inc()
+				continue
+			}
+			url = name
+			// Address is best-effort: a missing/odd shape leaves ip empty
+			// (the host is still scanned by name) instead of panicking.
+			if addrs, ok := result["addresses"].([]interface{}); ok && len(addrs) > 0 {
+				if addr0, ok := addrs[0].(map[string]interface{}); ok {
+					if ipStr, ok := addr0["ip"].(string); ok {
+						ip = ipStr
+					}
+				}
+			}
 		} else {
 			url = line
 		}
 		swg.Add()
 		go func(url string, ip string) {
 			defer swg.Done()
+			defer prog.inc()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "recovered while scanning %s: %v\n", url, r)
+				}
+			}()
 			c.startPortScan(url, ip, results)
 		}(url, ip)
 	}
 	swg.Wait()
+	prog.finish()
+	// Render the HTML report exactly once, from the complete result set, after
+	// all targets finish. Previously launchChrome regenerated the whole file
+	// after every host (O(n^2) rewrites with concurrent writers).
+	if *c.Options.Report {
+		report.Report_main(c.ResultArray, *c.Options.Screenshot)
+	}
 	close(results)
 }
 
@@ -106,42 +255,25 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 	swg := sizedwaitgroup.New(*c.Options.ChromeThreads)
 	var CdnName string
 	portTemp := portList
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-		DialContext:       c.Dialer.Dial,
-		DisableKeepAlives: true,
-	}
-	if *c.Options.Proxy != "" {
-		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-		if parseErr == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-			transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
-		}
-	}
-	c.HttpClient = &http.Client{
-		Timeout:   10 * time.Second,
-		Transport: transport,
-	}
-	if !*c.Options.FollowRedirect {
-		c.HttpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			//data.Infos.Location = fmt.Sprintf("%s", req.URL)
-			return http.ErrUseLastResponse
-		}
-	}
 
 	if !*c.Options.AmassInput {
-		c.HttpClient.Get("http://" + url)
+		c.throttle.wait(url)
+		// This request exists only to populate the dialer history so
+		// GetDialedIP works. Its body was never read nor closed, which parked a
+		// connection plus its reader/writer goroutines until the 10 s client
+		// timeout reaped them — one leaked socket per host.
+		if warm, err := c.HttpClient.Get("http://" + url); err == nil {
+			io.Copy(io.Discard, io.LimitReader(warm.Body, 4096))
+			warm.Body.Close()
+		}
 		ip = c.Dialer.GetDialedIP(url)
 	}
 	isCDN, cdnName, _, err := c.Cdn.Check(net.ParseIP(ip))
 	//fmt.Println(isCDN, ip)
 	if err != nil {
-		log.Fatal(err)
+		// A CDN lookup failure for a single IP must not abort the whole
+		// scan; treat the host as non-CDN and carry on.
+		isCDN = false
 	}
 	//fmt.Println(isCDN)
 	if isCDN {
@@ -149,31 +281,51 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 		CdnName = cdnName
 	}
 	var portOpen []string
-	alreadyScanned := lib.CheckIpAlreadyScan(ip, c.PortOpenByIP)
-	if alreadyScanned.IP != "" {
-		portOpen = alreadyScanned.Open_port
+	// An empty IP means the address was never resolved; every such host would
+	// otherwise share one bogus cache entry and inherit another host's ports.
+	cached, hit := []string(nil), false
+	if ip != "" {
+		c.portMu.RLock()
+		cached, hit = c.portOpenByIP[ip]
+		c.portMu.RUnlock()
+	}
+	if hit {
+		portOpen = cached
 	} else {
+		// Each scanner goroutine reports its open port on a buffered channel
+		// instead of appending to a shared slice (which raced). The buffer is
+		// sized to the port count so a send never blocks.
+		portChan := make(chan string, len(portTemp))
 		for _, portEnum := range portTemp {
 			swg1.Add()
 			go func(portEnum string, url string) {
 				defer swg1.Done()
-				openPort := c.scanPort("tcp", url, portEnum, *c.Options.Porttimeout)
-				if openPort {
-					portOpen = append(portOpen, portEnum)
+				if c.scanPort("tcp", url, portEnum, *c.Options.Porttimeout) {
+					portChan <- portEnum
 				}
 			}(portEnum, url)
 		}
 		swg1.Wait()
-		var tempScanned structure.PortOpenByIp
-		tempScanned.IP = ip
-		tempScanned.Open_port = portOpen
-		c.PortOpenByIP = append(c.PortOpenByIP, tempScanned)
+		close(portChan)
+		for p := range portChan {
+			portOpen = append(portOpen, p)
+		}
+		if ip != "" {
+			c.portMu.Lock()
+			c.portOpenByIP[ip] = portOpen
+			c.portMu.Unlock()
+		}
 	}
 	url = strings.TrimSpace(url)
 	for _, port := range portOpen {
 		swg.Add()
 		go func(port string, url string, portOpen []string, CdnName string, c *Cmd) {
 			defer swg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Fprintf(os.Stderr, "recovered while probing %s:%s: %v\n", url, port, r)
+				}
+			}()
 			data := structure.Data{}
 			data.Infos.CDN = CdnName
 			data.Infos.Data = url
@@ -195,28 +347,24 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 	} else {
 		urlDataPort = urlData
 	}
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	if *c.Options.Proxy != "" {
-		proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-		if parseErr == nil {
-			http.DefaultTransport.(*http.Transport).Proxy = http.ProxyURL(proxyURL)
-			http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12}
-		}
-	}
-	client := c.getClientCtx()
+	client := c.HttpClient
 
 	var TempResp structure.Response
 	//resp, errSSL = client.Get("https://" + urlDataPort)
 	var errSSL error
 	if port != "80" {
+		c.throttle.wait(urlData)
 		request, _ := http.NewRequest("GET", "https://"+urlDataPort, nil)
+		setBrowserHeaders(request, c.probeIdentity())
 		resp, errSSL = Do(request, client)
 	}
 	if errSSL != nil || port == "80" {
 		if port == "443" {
 			errorContinue = false
 		} else {
+			c.throttle.wait(urlData)
 			request, _ := http.NewRequest("GET", "http://"+urlDataPort, nil)
+			setBrowserHeaders(request, c.probeIdentity())
 			resp, errPlain := Do(request, client)
 			if errPlain != nil || resp == nil {
 
@@ -246,42 +394,43 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, urlData string, port string, results chan structure.Data) {
 	var err error
 	if data.Infos.Location != "" {
-		urlData = data.Infos.Location
+		urlData = resolveLocation(urlData, data.Infos.Location)
 	}
-	dnsData, err := c.Dialer.GetDNSData(data.Infos.Data)
-	if dnsData != nil && err == nil {
+	dnsData := c.dns.resolve(data.Infos.Data)
+	if dnsData != nil {
 		data.Infos.Cname = dnsData.CNAME
 	}
 	analyseStruct := analyze.Analyze{}
-	ctxAlloc1, _ := context.WithTimeout(c.ChromeCtx, 60*time.Second)
+	ctxAlloc1, cancelTimeout := context.WithTimeout(c.ChromeCtx, 60*time.Second)
+	defer cancelTimeout()
 	cloneCTX, cancel := chromedp.NewContext(ctxAlloc1)
 	chromedp.ListenTarget(cloneCTX, func(ev interface{}) {
 		if _, ok := ev.(*network.EventResponseReceived); ok {
 			//data, _ := network.GetResponseBody(ev.(*network.EventResponseReceived).RequestID).Do(cloneCTX)
 
 			//log.Println(string(data))
-			switch typeDoc := ev.(*network.EventResponseReceived).Type; typeDoc {
+			ev := ev.(*network.EventResponseReceived)
+			switch ev.Type {
 			case "XHR":
-				analyseStruct.XHRUrl = append(analyseStruct.XHRUrl, ev.(*network.EventResponseReceived).Response.URL)
-			case "Stylesheet":
-				//analyseStruct.CSSContent = append(analyseStruct.CSSContent,ev.(*network.EventResponseReceived).Response.URL)
-
-			case "Script":
-				//analyseStruct.CSSContent = append(analyseStruct.CSSContent,ev.(*network.EventResponseReceived).Response.URL)
+				analyseStruct.AddXHRUrl(ev.Response.URL)
+			case "Document":
+				// Headers of the page Chrome actually landed on. The raw probe
+				// stops at the 30x by default, so its headers describe the
+				// redirect, not the page that gets analysed — which is why a
+				// host redirecting http->https reported none of its header-based
+				// technologies (no Server, no X-Powered-By) even though the DOM
+				// ones came through.
+				analyseStruct.SetFinalHeaders(ev.Response.URL, ev.Response.Headers)
 			}
 		}
 		if _, ok := ev.(*page.EventJavascriptDialogOpening); ok {
-			//fmt.Println("closing alert:", ev.Message)
+			// Dismiss the dialog and say nothing else. This handler used to
+			// json.Marshal the shared result struct — racing the goroutine
+			// writing it — and print it to stdout, injecting a duplicate,
+			// half-filled record into the JSON stream.
 			go func() {
-				if err := chromedp.Run(cloneCTX,
-					page.HandleJavaScriptDialog(true),
-				); err != nil {
-					b, err := json.Marshal(data)
-					if err != nil {
-						fmt.Println("Error:", err)
-					}
-					fmt.Println(string(b))
-					return
+				if err := chromedp.Run(cloneCTX, page.HandleJavaScriptDialog(true)); err != nil {
+					fmt.Fprintf(os.Stderr, "dismiss dialog on %s: %v\n", urlData, err)
 				}
 			}()
 		}
@@ -291,11 +440,37 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 	//var res []string
 	var buf []byte
 
+	c.throttle.wait(data.Infos.Data)
 	err = chromedp.Run(cloneCTX,
+		// Close the Runtime.enable CDP leak before anything loads.
+		//
+		// chromedp calls runtime.Enable() once when it attaches to the tab
+		// (chromedp@v0.16.0/chromedp.go:445), and a page can observe that the
+		// domain is enabled — the most widely cited CDP detection method.
+		// Disabling it again costs nothing here: enable only controls *events*,
+		// while Runtime.evaluate is a command that works either way, so all 3155
+		// js patterns keep running in the main world, which they require.
+		//
+		// The one thing this gives up is chromedp's execution-context tracking
+		// (Target.execContexts), read only by its selector-based actions —
+		// WaitVisible, Nodes, Query, Poll and friends. wappaGo uses none of them:
+		// the complete list is Evaluate, Navigate, Title, CaptureScreenshot,
+		// Sleep, ActionFunc and ListenTarget, and Title is itself an
+		// EvaluateAsDevTools. Adding a selector action later means removing this.
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return runtime.Disable().Do(ctx)
+		}),
+		// Install the User-Agent and its matching Client Hints before the first
+		// navigation, so the very first request carries a consistent identity.
+		applyIdentity(c.identity, *c.Options.Headless),
 		chromedp.Navigate(urlData),
 		chromedp.Title(&data.Infos.Title),
-		//chromedp.FullScreenshot(&buf, 100),
-		chromedp.CaptureScreenshot(&buf),
+		// The screenshot is optional and must never be able to cost a detection.
+		// It used to sit here unconditionally, so on a page where
+		// Page.captureScreenshot failed (-32000) the action chain aborted and the
+		// host was reported with zero technologies — and it ran even without
+		// -screenshot, paying for a full PNG encode per page just to discard it.
+		captureScreenshot(*c.Options.Screenshot != "", &buf),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 
 			cookiesList, _ := network.GetCookies().Do(ctx)
@@ -315,17 +490,20 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 			body, err := dom.GetOuterHTML().WithNodeID(node.NodeID).Do(ctx)
 			if err == nil {
 				reader := strings.NewReader(body)
-				doc, err := goquery.NewDocumentFromReader(reader)
-	
-				if err != nil {
-					log.Fatal(err)
+				doc, errDoc := goquery.NewDocumentFromReader(reader)
+
+				if errDoc != nil {
+					// Malformed DOM: skip analysis for this target rather
+					// than killing the whole process.
+					return errDoc
 				}
+				analyseStruct.Doc = doc
 				var srcList []string
 				doc.Find("script").Each(func(i int, s *goquery.Selection) {
 					srcLink, exist := s.Attr("src")
-	
+
 					if exist {
-	
+
 						//fmt.Println(srcList, srcLink)
 						srcList = append(srcList, srcLink)
 					}
@@ -336,7 +514,10 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 
 			analyseStruct.ResultGlobal = c.ResultGlobal
 			analyseStruct.Resp = TempResp
-			
+			// The URL family matches against the page that was scanned, not
+			// against the Location header.
+			analyseStruct.Url = urlData
+
 			analyseStruct.Ctx = ctx
 			analyseStruct.Hote = data.Infos
 			analyseStruct.CookiesList = cookiesList
@@ -350,29 +531,74 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 		}),
 	)
 
+	// chromedp.Run's error used to be assigned and never read, so a failed
+	// navigation looked exactly like a page that rendered cleanly and happened
+	// to run no technologies. Record it and say so on stderr.
+	if err != nil {
+		data.Infos.Error = err.Error()
+		fmt.Fprintf(os.Stderr, "render %s: %v\n", urlData, err)
+	}
+
 	data.Infos.Technologies = technologies.DedupTechno(data.Infos.Technologies)
+	// Drop technologies whose "requires" precondition isn't met by the rest of
+	// the detected set (e.g. a plugin without the platform it needs), then drop
+	// any that a detected technology declares it cannot coexist with.
+	data.Infos.Technologies = technologies.FilterRequired(data.Infos.Technologies, c.ResultGlobal)
+	data.Infos.Technologies = technologies.FilterExcluded(data.Infos.Technologies, c.ResultGlobal)
 	if *c.Options.Screenshot != "" && len(buf) > 0 {
-		imgTitle := strings.Replace(urlData, ":", "_", -1)
-		imgTitle = strings.Replace(imgTitle, "/", "", -1)
-		imgTitle = strings.Replace(imgTitle, ".", "_", -1)
-		//fmt.Println(screen + "/" + imgTitle + ".png")
-		file, _ := os.OpenFile(
+		// Name the screenshot by the SHA-1 of its URL. The previous scheme
+		// stripped ':' '/' '.' from the URL, which collapsed distinct URLs to
+		// the same filename and silently overwrote screenshots.
+		imgTitle := fmt.Sprintf("%x", sha1.Sum([]byte(urlData)))
+		file, err := os.OpenFile(
 			*c.Options.Screenshot+"/"+imgTitle+".png",
 			os.O_WRONLY|os.O_TRUNC|os.O_CREATE,
 			0666,
 		)
-		file.Write(buf)
-		file.Close()
-		data.Infos.Screenshot = imgTitle + ".png"
+		if err == nil {
+			file.Write(buf)
+			file.Close()
+			data.Infos.Screenshot = imgTitle + ".png"
+		}
 	}
+	// The HTML report is an additional sink, not a replacement for the JSON
+	// stream. -report used to take the else branch away entirely, so
+	// `wappaGo -report > out.json` wrote an empty file and the run looked like
+	// it had detected nothing.
 	if *c.Options.Report {
+		c.reportMu.Lock()
 		c.ResultArray = append(c.ResultArray, data)
-	} else {
-		results <- data
+		c.reportMu.Unlock()
 	}
-	if *c.Options.Report {
-		report.Report_main(c.ResultArray, *c.Options.Screenshot)
+	results <- data
+}
+
+// resolveLocation resolves a redirect target against the URL that was actually
+// probed.
+//
+// A Location header is allowed to be relative (RFC 7231 §7.1.2) and very often
+// is — "https://stackoverflow.com" answers "302 Location: /questions". Feeding
+// that raw value to chromedp.Navigate fails, which aborted the whole action
+// chain, so Title, the screenshot and every technology matcher were skipped and
+// the host was emitted with an empty title and zero technologies.
+//
+// Anything that does not resolve to http(s) is refused and the probed URL is
+// kept: a scanned host must not be able to steer the operator's browser to
+// file:// or javascript:.
+func resolveLocation(probed string, location string) string {
+	base, err := URL.Parse(probed)
+	if err != nil {
+		return probed
 	}
+	ref, err := URL.Parse(strings.TrimSpace(location))
+	if err != nil {
+		return probed
+	}
+	target := base.ResolveReference(ref)
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return probed
+	}
+	return target.String()
 }
 
 func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) bool {
@@ -385,128 +611,193 @@ func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) 
 	return true
 }
 
+// probeIdentity is the identity the raw HTTP probe presents. It is the same one
+// the browser gets; when Start has not resolved it yet (library callers, tests)
+// it falls back to the built-in one so the header set stays self-consistent
+// rather than half-filled.
+func (c *Cmd) probeIdentity() identity {
+	id := c.identity
+	if id.UserAgent == "" {
+		id = fallbackIdentity()
+	}
+	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
+		id.UserAgent = *c.Options.UserAgent
+		// An operator-supplied UA drives the Client Hints too, so the two cannot
+		// end up describing different browsers.
+		if major := chromeMajor(id.UserAgent); major != "" {
+			id.Major = major
+			if full := versionAfter(id.UserAgent, "Chrome/"); full != "" {
+				id.Full = full
+			}
+		}
+	}
+	if id.Platform == "" {
+		id.Platform = "Windows"
+	}
+	return id
+}
+
+// setBrowserHeaders makes the raw HTTP probe look like the same Chrome that
+// drives the rendering pass, so a WAF sees one consistent browser instead of
+// the default "Go-http-client/1.1". Accept-Encoding is left unset on purpose so
+// Go keeps decompressing gzip transparently.
+func setBrowserHeaders(req *http.Request, id identity) {
+	h := req.Header
+	h.Set("User-Agent", id.UserAgent)
+	// Byte-for-byte what Chrome 1xx sends on a document navigation. The probe
+	// used to omit the signed-exchange entry and to hardcode a language Chrome
+	// itself did not use, so the two clients disagreed on every host.
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	h.Set("Accept-Language", acceptLanguageHeader)
+	h.Set("Upgrade-Insecure-Requests", "1")
+	h.Set("Sec-Fetch-Dest", "document")
+	h.Set("Sec-Fetch-Mode", "navigate")
+	h.Set("Sec-Fetch-Site", "none")
+	h.Set("Sec-Fetch-User", "?1")
+	// Derived from the same identity the browser is given, so the probe and
+	// Chrome cannot disagree on the brands, their order or the version.
+	if id.Major != "" {
+		h.Set("Sec-Ch-Ua", id.secChUa())
+		h.Set("Sec-Ch-Ua-Mobile", "?0")
+		h.Set("Sec-Ch-Ua-Platform", `"`+id.Platform+`"`)
+	}
+}
+
+// chromeMajor extracts the Chrome major version from a UA string ("" if none).
+func chromeMajor(ua string) string {
+	i := strings.Index(ua, "Chrome/")
+	if i < 0 {
+		return ""
+	}
+	rest := ua[i+len("Chrome/"):]
+	j := 0
+	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {
+		j++
+	}
+	return rest[:j]
+}
+
+// maxProbeBody caps how much of a probed body is read. Only the metrics below
+// use it — technology detection runs on the DOM Chrome renders, not on this.
+const maxProbeBody = 4096
+
 // Do http request
 func Do(req *http.Request, client *http.Client) (*structure.Response, error) {
 	var gzipRetry bool
+	started := time.Now()
 get_response:
 	httpresp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	defer httpresp.Body.Close()
 
 	var resp structure.Response
 
+	// Response.Duration was read into Host.Response_time but never assigned, so
+	// every result reported response_time: 0 and the report's "time" row was
+	// always blank.
+	resp.Duration = time.Since(started)
 	resp.Headers = httpresp.Header.Clone()
 
-	// httputil.DumpResponse does not handle websockets
-	headers, rawResp, err := pdhttputil.DumpResponseHeadersAndRaw(httpresp)
-	if err != nil {
-		// Edge case - some servers respond with gzip encoding header but uncompressed body, in this case the standard library configures the reader as gzip, triggering an error when read.
-		// The bytes slice is not accessible because of abstraction, therefore we need to perform the request again tampering the Accept-Encoding header
-		if !gzipRetry && strings.Contains(err.Error(), "gzip: invalid header") {
-			gzipRetry = true
-			req.Header.Set("Accept-Encoding", "identity")
-			goto get_response
-		}
-
-		return nil, err
-
-	}
-	resp.Raw = string(rawResp)
-	resp.RawHeaders = string(headers)
+	// The previous implementation ran pdhttputil.DumpResponseHeadersAndRaw here,
+	// whose DumpResponse(resp, true) reads the ENTIRE body into memory and then
+	// copies it again — before the deliberate 4096-byte cap below ever applied.
+	// The size was dictated purely by the scanned host, so a large or
+	// heavily-compressed response could exhaust the scanner's memory. Its only
+	// outputs were Response.Raw and Response.RawHeaders, which nothing read.
 
 	var respbody []byte
 	// websockets don't have a readable body
 	if httpresp.StatusCode != http.StatusSwitchingProtocols {
-		var err error
-		respbody, err = ioutil.ReadAll(io.LimitReader(httpresp.Body, 4096))
+		respbody, err = io.ReadAll(io.LimitReader(httpresp.Body, maxProbeBody))
 		if err != nil {
-
+			// Some servers advertise gzip but send an uncompressed body; the
+			// stdlib then wires up a gzip reader that fails on the first read.
+			// Retry once asking for identity.
+			if !gzipRetry && strings.Contains(err.Error(), "gzip: invalid header") {
+				gzipRetry = true
+				req.Header.Set("Accept-Encoding", "identity")
+				httpresp.Body.Close()
+				goto get_response
+			}
 			return nil, err
 		}
 	}
 
-	closeErr := httpresp.Body.Close()
-	if closeErr != nil {
-		return nil, closeErr
-	}
-
-	respbodystr := string(respbody)
-
-	// if content length is not defined
-	if resp.ContentLength <= 0 {
-		// check if it's in the header and convert to int
-		if contentLength, ok := resp.Headers["Content-Length"]; ok {
-			contentLengthInt, _ := strconv.Atoi(strings.Join(contentLength, ""))
-			resp.ContentLength = contentLengthInt
-		}
-
-		// if we have a body, then use the number of bytes in the body if the length is still zero
-		if resp.ContentLength <= 0 && len(respbodystr) > 0 {
-			resp.ContentLength = utf8.RuneCountInString(respbodystr)
-		}
-	}
-
-	resp.Data = respbody
-
-	// fill metrics
 	resp.StatusCode = httpresp.StatusCode
-	// number of words
-	resp.Words = len(strings.Split(respbodystr, " "))
-	// number of lines
-	resp.Lines = len(strings.Split(respbodystr, "\n"))
+
+	// Prefer the advertised length; fall back to what was actually read. The
+	// fallback is capped by maxProbeBody, so it under-reports on a large body
+	// that omits Content-Length.
+	if contentLength, ok := resp.Headers["Content-Length"]; ok {
+		if n, convErr := strconv.Atoi(strings.Join(contentLength, "")); convErr == nil && n >= 0 {
+			resp.ContentLength = n
+		}
+	}
+	if resp.ContentLength <= 0 && len(respbody) > 0 {
+		resp.ContentLength = utf8.RuneCountInString(string(respbody))
+	}
 
 	return &resp, nil
 }
 
-func (c *Cmd) InitDialer() *fastdialer.Dialer {
+// defaultResolvers are used when -resolvers is not set.
+const defaultResolvers = "8.8.8.8,1.1.1.1,64.6.64.6,74.82.42.42,1.0.0.1,8.8.4.4,64.6.65.6,77.88.8.8"
+
+// resolvers returns the resolver list to use, honouring -resolvers.
+//
+// It does not write through the option pointer: in library mode that pointer may
+// alias a caller's struct field.
+func (c *Cmd) resolvers() []string {
+	list := defaultResolvers
+	if c.Options.Resolvers != nil && *c.Options.Resolvers != "" {
+		list = *c.Options.Resolvers
+	}
+	return strings.Split(list, ",")
+}
+
+// InitDialer builds the resolving dialer. It used to swallow the error and hand
+// back a nil *Dialer, which the caller then used as if it were valid.
+func (c *Cmd) InitDialer() (*fastdialer.Dialer, error) {
 	fastdialerOpts := fastdialer.DefaultOptions
 	fastdialerOpts.EnableFallback = true
 	fastdialerOpts.WithDialerHistory = true
+	fastdialerOpts.BaseResolvers = c.resolvers()
 
-	if len(*c.Options.Resolvers) == 0 {
-		*c.Options.Resolvers = "8.8.8.8,1.1.1.1,64.6.64.6,74.82.42.42,1.0.0.1,8.8.4.4,64.6.65.6,77.88.8.8"
-	}
-	fastdialerOpts.BaseResolvers = strings.Split(*c.Options.Resolvers, ",")
-
-	dialer, err := fastdialer.NewDialer(fastdialerOpts)
-	if err != nil {
-		fmt.Errorf("could not create resolver cache: %s", err)
-	}
-	return dialer
+	return fastdialer.NewDialer(fastdialerOpts)
 }
 
-func (c *Cmd) getClientCtx() *http.Client {
-	if c.HttpClient == (&http.Client{}) {
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-			DialContext:       c.Dialer.Dial,
-			DisableKeepAlives: true,
-		}
-		if *c.Options.Proxy != "" {
-			proxyURL, parseErr := URL.Parse(*c.Options.Proxy)
-			if parseErr == nil {
-				transport.Proxy = http.ProxyURL(proxyURL)
-				transport.TLSClientConfig.MinVersion = tls.VersionTLS12
-				transport.TLSClientConfig.MaxVersion = tls.VersionTLS12
+// buildHTTPClient constructs the single, shared HTTP client used for every
+// probe. It is called once from Start(); the returned client (and its
+// transport) is never mutated afterwards, so it is safe to share across all
+// target/port goroutines.
+func (c *Cmd) buildHTTPClient() *http.Client {
+	// A proxy tunnels the origin handshake through CONNECT, so the ClientHello
+	// is not ours to shape; that path keeps the standard transport. The
+	// MaxVersion pin that used to be here as well has been dropped: capping the
+	// tunnel at TLS 1.2 hid every TLS-1.3-only origin behind a probe failure.
+	var proxyTransport *http.Transport
+	if *c.Options.Proxy != "" {
+		if proxyURL, parseErr := URL.Parse(*c.Options.Proxy); parseErr == nil {
+			proxyTransport = &http.Transport{
+				TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12},
+				DialContext:       c.Dialer.Dial,
+				DisableKeepAlives: true,
+				Proxy:             http.ProxyURL(proxyURL),
 			}
 		}
-		client := &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: transport,
-		}
-		if !*c.Options.FollowRedirect {
-			client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-				//data.Infos.Location = fmt.Sprintf("%s", req.URL)
-				return http.ErrUseLastResponse
-			}
-		}
-		return client
-	} else {
-		return c.HttpClient
 	}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: newHTTPTransport(c.Dialer.Dial, proxyTransport),
+	}
+	if !*c.Options.FollowRedirect {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+	}
+	return client
 }
 
 func (c *Cmd) DefineBasicMetric(data structure.Data, resp *structure.Response) (structure.Data, structure.Response, error) {
