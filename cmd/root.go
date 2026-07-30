@@ -52,6 +52,9 @@ type Cmd struct {
 	reportMu     sync.Mutex // guards ResultArray (report mode)
 	throttle     *hostThrottle
 	Input        []string
+	// identity is the browser identity presented to every scanned host, read
+	// from the real Chrome build in Start before any worker starts.
+	identity identity
 	// sigCtx is cancelled on SIGINT/SIGTERM. It gates the host loop and the
 	// port scanner so Ctrl+C actually stops the scan; previously it only
 	// parented the Chrome allocator, so the first Ctrl+C killed the browser and
@@ -93,21 +96,12 @@ func (c *Cmd) Start(results chan structure.Data) {
 	// -rps or -jitter is set).
 	c.throttle = newHostThrottle(*c.Options.Rps, *c.Options.Jitter)
 
-	optionsChromeCtx := []chromedp.ExecAllocatorOption{}
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.DefaultExecAllocatorOptions[:]...)
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("headless", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-popup-blocking", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.DisableGPU)
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-webgl", true))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("ignore-certificate-errors", true)) // RIP shittyproxy.go
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.WindowSize(1400, 900))
-	// Present a real browser UA (drops the "HeadlessChrome" token) and hide the
-	// automation flag, so Chrome blends in with normal traffic.
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.UserAgent(c.userAgent()))
-	optionsChromeCtx = append(optionsChromeCtx, chromedp.Flag("disable-blink-features", "AutomationControlled"))
-	if *c.Options.Proxy != "" {
-		optionsChromeCtx = append(optionsChromeCtx, chromedp.ProxyServer(*c.Options.Proxy))
-	}
+	// The User-Agent is left to Chrome at launch: overriding it here with a
+	// hardcoded version contradicted the Sec-CH-UA headers Chrome derives from
+	// its own build (measured: UA said Chrome/131 while Sec-CH-UA said 150).
+	// resolveIdentity below reads the real build and installs a consistent
+	// identity per target instead.
+	optionsChromeCtx := chromeAllocatorOptions(c.Options, "")
 
 	// Tie the browser lifetime to SIGINT/SIGTERM: the first Ctrl+C cancels this
 	// context, which tears Chrome down and lets the deferred cleanup (browser
@@ -146,6 +140,10 @@ func (c *Cmd) Start(results chan structure.Data) {
 	c.ChromeCtx = ctxAlloc1
 	defer cancel()
 
+	// Read the real browser build once, up front, and present that same
+	// identity everywhere: the Chrome targets (User-Agent + Client Hints) and
+	// the raw HTTP probe's headers. c.identity is written here, before any
+	// worker exists, and only read afterwards.
 	if err := chromedp.Run(c.ChromeCtx); err != nil {
 		// Startup failure (including a cancel during launch) is reported and the
 		// results channel is closed so the consumer drains and exits cleanly,
@@ -153,6 +151,19 @@ func (c *Cmd) Start(results chan structure.Data) {
 		fmt.Fprintf(os.Stderr, "could not start Chrome: %v\n", err)
 		close(results)
 		return
+	}
+
+	if id, err := resolveIdentity(c.ChromeCtx); err != nil {
+		fmt.Fprintf(os.Stderr, "could not read the browser build, using the fallback identity: %v\n", err)
+		c.identity = id
+	} else {
+		c.identity = id
+	}
+	// An explicit -user-agent still wins, but the Client Hints metadata keeps
+	// following the real build, so the two cannot contradict each other on the
+	// version the way a hardcoded UA did.
+	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
+		c.identity.UserAgent = *c.Options.UserAgent
 	}
 
 	c.Cdn = cdncheck.New()
@@ -410,10 +421,17 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 
 	c.throttle.wait(data.Infos.Data)
 	err = chromedp.Run(cloneCTX,
+		// Install the User-Agent and its matching Client Hints before the first
+		// navigation, so the very first request carries a consistent identity.
+		applyIdentity(c.identity),
 		chromedp.Navigate(urlData),
 		chromedp.Title(&data.Infos.Title),
-		//chromedp.FullScreenshot(&buf, 100),
-		chromedp.CaptureScreenshot(&buf),
+		// The screenshot is optional and must never be able to cost a detection.
+		// It used to sit here unconditionally, so on a page where
+		// Page.captureScreenshot failed (-32000) the action chain aborted and the
+		// host was reported with zero technologies — and it ran even without
+		// -screenshot, paying for a full PNG encode per page just to discard it.
+		captureScreenshot(*c.Options.Screenshot != "", &buf),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 
 			cookiesList, _ := network.GetCookies().Do(ctx)
@@ -554,9 +572,14 @@ func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) 
 	return true
 }
 
-// userAgent returns the configured User-Agent, falling back to the built-in
-// browser UA when none is set (e.g. library mode with an empty option).
+// userAgent returns the User-Agent presented to scanned hosts. Once Start has
+// read the real browser build this is that build's UA; before then (or if the
+// browser could not be queried) it is the explicit -user-agent, then the
+// built-in fallback.
 func (c *Cmd) userAgent() string {
+	if c.identity.UserAgent != "" {
+		return c.identity.UserAgent
+	}
 	if c.Options.UserAgent != nil && *c.Options.UserAgent != "" {
 		return *c.Options.UserAgent
 	}
@@ -570,8 +593,11 @@ func (c *Cmd) userAgent() string {
 func setBrowserHeaders(req *http.Request, ua string) {
 	h := req.Header
 	h.Set("User-Agent", ua)
-	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-	h.Set("Accept-Language", "en-US,en;q=0.9")
+	// Byte-for-byte what Chrome 1xx sends on a document navigation. The probe
+	// used to omit the signed-exchange entry and to hardcode a language Chrome
+	// itself did not use, so the two clients disagreed on every host.
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
+	h.Set("Accept-Language", acceptLanguageHeader)
 	h.Set("Upgrade-Insecure-Requests", "1")
 	h.Set("Sec-Fetch-Dest", "document")
 	h.Set("Sec-Fetch-Mode", "navigate")

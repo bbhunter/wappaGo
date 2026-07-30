@@ -84,6 +84,41 @@ The technology fingerprints are downloaded at startup from
 [Serizao/tech](https://github.com/Serizao/tech), parsed into memory, and the
 on-disk copy is deleted before the scan begins.
 
+## Blending in
+
+wappaGo presents one consistent browser identity to every host it scans. The
+User-Agent is read from the installed Chrome at startup (with the
+`HeadlessChrome` token rewritten) and installed together with its matching
+Client Hints metadata, so `navigator.userAgent`, `navigator.userAgentData` and
+the `Sec-CH-UA-*` headers all report the same build. The raw HTTP probe sends
+the same User-Agent, `Accept` and `Accept-Language`. `--enable-automation` is not
+passed, and WebGL is left enabled.
+
+A measurement harness records what the browser actually gives away:
+
+```bash
+WAPPAGO_STEALTH_CHECK=1 go test ./cmd/ -run Stealth -v
+```
+
+It serves its own page locally, so the verdicts are reproducible. Two known
+limits it reports rather than hides:
+
+- **`window.outerWidth` / `outerHeight` are 0.** Headless Chrome has no real
+  window and no CDP call changes this. The usual workaround redefines the
+  accessor from an injected script, which leaves a getter that no longer reports
+  `[native code]` — a broader tell than the one it fixes, so it is not done.
+- **WebGL quality depends on the host.** On a machine with a GPU, Chrome reports
+  the real adapter, which is the most plausible fingerprint available. On a
+  GPU-less server or container it falls back to software rendering and the
+  renderer string says so (`SwiftShader`, `Microsoft Basic Render Driver`,
+  `llvmpipe`). The harness logs a `NOTE:` when that happens. Running with a GPU,
+  or with a virtual display, gives a stronger identity.
+
+Canvas, WebGL and audio fingerprints are deliberately **not** randomised. The
+goal is to look ordinary, not unique: a fingerprint that changes between two
+reads is itself a signature of an anti-fingerprinting tool. The harness asserts
+those surfaces are present and stable instead.
+
 You can either use wappaGo from a file containing a list of domains
 ```bash
 cat domain.txt | ./wappaGo
