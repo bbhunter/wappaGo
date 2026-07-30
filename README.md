@@ -2,8 +2,8 @@
 
 <p align="center">  
     <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/license-MIT-_red.svg"></a>  
-    <a href="https://github.com/EasyRecon/Hunt3r/issues"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat"></a>  
-    <a href="https://github.com/EasyRecon/Hunt3r"><img src="https://img.shields.io/badge/release-v0.0.8-informational"></a>
+    <a href="https://github.com/EasyRecon/wappaGo/issues"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen.svg?style=flat"></a>  
+    <a href="https://github.com/EasyRecon/wappaGo/releases/latest"><img src="https://img.shields.io/github/v/release/EasyRecon/wappaGo?label=release&color=informational"></a>
     <a href="https://github.com/easyrecon/wappago/issues" target="_blank"><img src="https://img.shields.io/github/issues/easyrecon/wappago?color=blue" /></a>
 </p>
 
@@ -34,7 +34,25 @@ or
 go install github.com/EasyRecon/wappaGo@latest
 ```
 
-**Note :** _wappaGo requires Chrome to be present on the system_
+Building from source needs **Go 1.26** or newer.
+
+## Requirements
+
+- **Chrome** installed on the system.
+- **A display.** Chrome runs headed by default, because headless reports a fake
+  800x600 screen and brands its own User-Agent. On a desktop this is already the
+  case; on a server, run wappaGo under a virtual display:
+
+  ```bash
+  xvfb-run -a --server-args="-screen 0 1920x1080x24" ./wappaGo < domain.txt
+  ```
+
+  Pass `-headless` instead if you would rather not install one — it works, it is
+  just easier to fingerprint. Without a display and without `-headless`, Chrome
+  will not start and wappaGo tells you so.
+- **Outbound HTTPS to `raw.githubusercontent.com`**, to fetch the technology
+  fingerprints at startup. A failure here is fatal rather than silently scanning
+  with an empty database.
 
 # Usage
 

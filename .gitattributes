@@ -1,0 +1,19 @@
+# Keep LF in the working tree on every platform.
+#
+# Git already stores these as LF, but with core.autocrlf=true a Windows checkout
+# converts them to CRLF, and gofmt then reports every single .go file as
+# unformatted even though the content is byte-identical to its own output. That
+# makes the `gofmt -l` gate in .github/workflows/go.yml impossible to reproduce
+# locally on Windows: it passes on the Linux runner and fails on the contributor's
+# machine, for no real reason.
+*.go    text eol=lf
+*.mod   text eol=lf
+*.sum   text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+
+# Binary, never touch.
+*.png   binary
+*.exe   binary
+*.svg   text eol=lf
