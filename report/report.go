@@ -161,12 +161,18 @@ func humanizeBytes(n int) string {
 	if n < unit {
 		return strconv.Itoa(n) + " B"
 	}
+	// The exponent must stay inside units. Content_length is attacker-supplied
+	// (it is parsed straight from the Content-Length header in cmd.Do), and a
+	// host advertising >= 1024^5 bytes used to push exp past the end of the old
+	// 4-character "KMGT" string — an index-out-of-range panic in the report
+	// writer, which destroyed the whole run's output.
+	const units = "KMGTPE"
 	div, exp := int64(unit), 0
-	for x := int64(n) / unit; x >= unit; x /= unit {
+	for x := int64(n) / unit; x >= unit && exp < len(units)-1; x /= unit {
 		div *= unit
 		exp++
 	}
-	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), units[exp])
 }
 
 func formatDuration(d time.Duration) string {

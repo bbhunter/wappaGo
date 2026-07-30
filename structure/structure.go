@@ -1,20 +1,26 @@
 package structure
 
-import (
-	"time"
-
-	"github.com/projectdiscovery/cryptoutil"
-)
+import "time"
 
 type Technologie struct {
-	Name       string `json:"name"`
-	Version    string `json:"version,omitempty"`
-	Cpe        string `json:"cpe,omitempty"`
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+	Cpe     string `json:"cpe,omitempty"`
+	// Icon is the fingerprint's icon filename (e.g. "Nginx.svg"), copied
+	// straight from the database. Omitted for technologies that declare none.
+	Icon       string `json:"icon,omitempty"`
 	Confidence string `json:"confidence,omitempty"`
 }
 
-const WappazlyerRoot = "https://raw.githubusercontent.com/dochne/wappalyzer/master/src"
-const LetterBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+// TechnologiesRoot is the base URL of the fingerprint database. The 27 shards
+// (_.json, a.json … z.json) live directly at this root.
+const TechnologiesRoot = "https://raw.githubusercontent.com/Serizao/tech/main"
+
+// WappazlyerRoot is the previous upstream, kept as a deprecated alias so
+// library users pinning it still compile.
+//
+// Deprecated: use TechnologiesRoot.
+const WappazlyerRoot = TechnologiesRoot
 
 // DefaultUserAgent is presented by both the raw HTTP probe and Chrome so a WAF
 // sees one consistent, browser-like client instead of "Go-http-client" then
@@ -40,6 +46,9 @@ type Host struct {
 	Cname          []string      `json:"cname,omitempty"`
 	CDN            string        `json:"cdn,omitempty"`
 	CertVhost      []string      `json:"certvhost,omitempty"`
+	// Error carries a failed render. Without it a host whose page never loaded
+	// is indistinguishable from one that loaded and genuinely runs nothing.
+	Error string `json:"error,omitempty"`
 }
 type Data struct {
 	Url   string `json:"url"`
@@ -62,6 +71,88 @@ type Options struct {
 	Jitter         *int
 	NoProgress     *bool
 }
+
+// Default values for Options. They are the single source of truth: main.go
+// passes them to the flag package, and ApplyDefaults repairs anything that
+// reaches cmd.Start unset or nonsensical.
+const (
+	DefaultPorts         = "80,443"
+	DefaultThreads       = 5
+	DefaultChromeThreads = 5
+	DefaultPortTimeout   = 2000
+)
+
+// ApplyDefaults fills in every unset or invalid field.
+//
+// Options is a struct of fourteen pointers that cmd dereferences unguarded, so
+// any nil is a crash. The library path built this struct by hand and forwarded
+// a caller's zero-valued WrapperOptions verbatim, which meant the documented
+// README example ran with Threads=0 and Porttimeout=0. A non-positive worker
+// count is also actively dangerous: sizedwaitgroup treats limit<=0 as unbounded,
+// so `-threads 0` removed the concurrency cap entirely.
+func (o *Options) ApplyDefaults() {
+	str := func(p **string, def string) {
+		if *p == nil {
+			v := def
+			*p = &v
+		} else if **p == "" {
+			**p = def
+		}
+	}
+	num := func(p **int, def int) {
+		if *p == nil {
+			v := def
+			*p = &v
+		} else if **p <= 0 {
+			**p = def
+		}
+	}
+	flag := func(p **bool) {
+		if *p == nil {
+			v := false
+			*p = &v
+		}
+	}
+
+	str(&o.Ports, DefaultPorts)
+	num(&o.Threads, DefaultThreads)
+	num(&o.ChromeThreads, DefaultChromeThreads)
+	num(&o.Porttimeout, DefaultPortTimeout)
+
+	// Empty is meaningful for these: no screenshots, system resolvers, no proxy,
+	// built-in User-Agent.
+	for _, p := range []**string{&o.Screenshot, &o.Resolvers, &o.Proxy, &o.UserAgent} {
+		if *p == nil {
+			v := ""
+			*p = &v
+		}
+	}
+	for _, p := range []**bool{&o.AmassInput, &o.FollowRedirect, &o.Report, &o.NoProgress} {
+		flag(p)
+	}
+	if o.ChromeTimeout == nil {
+		v := 0
+		o.ChromeTimeout = &v
+	}
+	// 0 means "unlimited" for both, so only a negative value is repaired.
+	if o.Rps == nil || *o.Rps < 0 {
+		v := 0.0
+		if o.Rps != nil {
+			*o.Rps = v
+		} else {
+			o.Rps = &v
+		}
+	}
+	if o.Jitter == nil || *o.Jitter < 0 {
+		v := 0
+		if o.Jitter != nil {
+			*o.Jitter = v
+		} else {
+			o.Jitter = &v
+		}
+	}
+}
+
 type WrapperOptions struct {
 	Screenshot     string
 	Ports          string
@@ -76,22 +167,15 @@ type WrapperOptions struct {
 	Rps            float64
 	Jitter         int
 }
+
+// Response is the raw HTTP probe result. It only carries what is actually
+// consumed: Headers feed the header matcher, the rest feed Host's metrics.
+// Raw, RawHeaders, Data, Words, Lines, TLSData, HTTP2 and Pipeline were removed
+// because nothing ever read them — and populating Raw meant buffering every
+// probed body whole, twice.
 type Response struct {
 	StatusCode    int
 	Headers       map[string][]string
-	Data          []byte
 	ContentLength int
-	Raw           string
-	RawHeaders    string
-	Words         int
-	Lines         int
-	TLSData       *cryptoutil.TLSData
-	HTTP2         bool
-	Pipeline      bool
 	Duration      time.Duration
-}
-
-type PortOpenByIp struct {
-	IP        string
-	Open_port []string
 }

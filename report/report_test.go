@@ -39,6 +39,41 @@ func TestCardEscapesXSS(t *testing.T) {
 	}
 }
 
+// TestHumanizeBytesDoesNotPanic pins the clamp on the unit exponent.
+// Content_length is parsed straight from the attacker-controlled Content-Length
+// header, and a host advertising >= 1024^5 bytes used to index past the end of
+// the 4-character "KMGT" string, panicking the report writer and destroying the
+// whole run's output.
+func TestHumanizeBytesDoesNotPanic(t *testing.T) {
+	const (
+		pib = 1 << 50
+		eib = 1 << 60
+	)
+	for _, n := range []int{0, -1, 1, 1023, 1024, 24576, 1 << 30, pib, 100 * pib, eib, 1<<63 - 1} {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("humanizeBytes(%d) panicked: %v", n, r)
+				}
+			}()
+			humanizeBytes(n)
+		}()
+	}
+
+	for n, want := range map[int]string{
+		0:     "",
+		-1:    "",
+		512:   "512 B",
+		24576: "24.0 KB",
+		pib:   "1.0 PB",
+		eib:   "1.0 EB",
+	} {
+		if got := humanizeBytes(n); got != want {
+			t.Errorf("humanizeBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
 // TestReportRendersFullPage exercises the whole report with varied hosts and
 // writes a sample to the temp dir for manual inspection.
 func TestReportRendersFullPage(t *testing.T) {

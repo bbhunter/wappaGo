@@ -37,10 +37,23 @@ func isTerminal(f *os.File) bool {
 
 // inc marks one host as processed and redraws the bar. Safe on a nil receiver.
 func (p *progress) inc() {
-	if p == nil || !p.enabled {
+	if p == nil {
 		return
 	}
-	p.render(int(atomic.AddInt32(&p.done, 1)))
+	n := atomic.AddInt32(&p.done, 1)
+	if !p.enabled {
+		return
+	}
+	p.render(int(n))
+}
+
+// processed returns how many hosts have completed. It is counted even when the
+// bar itself is disabled, so the interrupt path can report what was skipped.
+func (p *progress) processed() int32 {
+	if p == nil {
+		return 0
+	}
+	return atomic.LoadInt32(&p.done)
 }
 
 // line formats the static part of the bar (no rate/time), so it is pure and

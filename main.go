@@ -44,11 +44,13 @@ func configure(options structure.Options) {
 			}
 		}
 	}
-	folder, errDownload := technologies.DownloadTechnologies()
+	// The fingerprint database is downloaded, parsed and the on-disk copy
+	// deleted before this returns. Without it every host would report zero
+	// technologies, so a failure here is fatal rather than a logged warning.
+	resultGlobal, errDownload := technologies.Load()
 	if errDownload != nil {
-		log.Println("error during downloading techno file")
+		log.Fatalf("could not load the technology fingerprints: %v", errDownload)
 	}
-	defer os.RemoveAll(folder)
 
 	var input []string
 	var scanner = bufio.NewScanner(bufio.NewReader(os.Stdin))
@@ -57,7 +59,7 @@ func configure(options structure.Options) {
 	}
 
 	c := cmd.Cmd{}
-	c.ResultGlobal = technologies.LoadTechnologiesFiles(folder)
+	c.ResultGlobal = resultGlobal
 	c.Options = options
 	c.Input = input
 
@@ -70,7 +72,9 @@ func configure(options structure.Options) {
 	}
 	results := make(chan structure.Data, resultsBuffer)
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		for result := range results {
 			b, err := json.Marshal(result)
 
@@ -82,4 +86,9 @@ func configure(options structure.Options) {
 	}()
 
 	c.Start(results)
+	// Start closes the channel, but closing only wakes the consumer — it does
+	// not wait for it. Returning here would exit the process with up to
+	// resultsBuffer already-scanned hosts still sitting unprinted in the
+	// buffer, silently losing them on a perfectly successful run.
+	<-done
 }

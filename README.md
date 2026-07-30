@@ -48,6 +48,10 @@ Usage of wappaGo:
         Number of chromes threads in each main threads total = option.threads*option.chrome-threads (Default 5) (default 5)
   -follow-redirect
         Follow redirect to detect technologie
+  -jitter int
+        Max random delay in ms added before each request (0 = none)
+  -no-progress
+        Disable the stderr progress bar
   -port-timeout int
         Timeout during port scanning in ms (default 2000)
   -ports string
@@ -55,15 +59,30 @@ Usage of wappaGo:
   -proxy string
         Use http proxy
   -report
-        Generate HTML report
+        Generate HTML report (in addition to the JSON on stdout)
   -resolvers string
         Use specifique resolver separated by comma
+  -rps float
+        Max HTTP requests per second per host to stay under rate-based WAF rules (0 = unlimited)
   -screenshot string
         path to screenshot if empty no screenshot
   -threads int
         Number of threads to start recon in same time (default 5)
+  -user-agent string
+        User-Agent sent by both the HTTP probe and Chrome (blank keeps the built-in browser UA)
 
 ```
+
+Results are written to stdout as one JSON object per line, so `-report` can be
+combined with a redirect:
+
+```bash
+cat domain.txt | ./wappaGo -report > results.json   # JSON on stdout + wappaGo_report.html
+```
+
+The technology fingerprints are downloaded at startup from
+[Serizao/tech](https://github.com/Serizao/tech), parsed into memory, and the
+on-disk copy is deleted before the scan begins.
 
 You can either use wappaGo from a file containing a list of domains
 ```bash
@@ -94,16 +113,29 @@ type WrapperOptions struct {
 	ChromeTimeout  int
 	ChromeThreads  int
 	Proxy          string
+	UserAgent      string
+	Rps            float64
+	Jitter         int
 }
 ```
 
+Any field left at its zero value falls back to the same default as the
+corresponding CLI flag (`Ports: "80,443"`, `Threads: 5`, `ChromeThreads: 5`,
+`Porttimeout: 2000`), so you only have to set what you want to change.
+
 ## Example
+
+Both entry points return an `error`, which is non-nil when the setup itself
+failed — most often because the technology fingerprints could not be downloaded.
+Ignoring it means scanning every host with an empty database and reporting zero
+technologies everywhere.
 
 ```go
 package main
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/EasyRecon/wappaGo/structure"
 	"github.com/EasyRecon/wappaGo/wrapper"
@@ -117,26 +149,35 @@ func main() {
 		Screenshot: "screenshots",
 	}
 
-      // Async mode
+	// Sync mode: blocks, then returns everything.
+	results, err := wrapper.StartReconSync(input, options)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, result := range results {
+		fmt.Println(result)
+	}
+}
+```
 
+```go
+	// Async mode: results are streamed on the channel, which wrapper closes
+	// when the scan is done. StartReconAsync blocks until then, so run the
+	// consumer in its own goroutine and wait for it to drain.
 	results := make(chan structure.Data)
+	done := make(chan struct{})
 
 	go func() {
+		defer close(done)
 		for result := range results {
 			fmt.Println(result)
 		}
 	}()
 
-	wrapper.StartReconAsync(input, options, results)
-
-      // Sync mode
-
-      results := wrapper.StartReconSync(input, options)
-
-	for _, result := range results {
-		fmt.Println(result)
+	if err := wrapper.StartReconAsync(input, options, results); err != nil {
+		log.Fatal(err)
 	}
-}
+	<-done
 ```
 
 For each url, you will receive a structure.Data which contains all the information about the target.

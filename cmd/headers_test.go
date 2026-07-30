@@ -46,7 +46,7 @@ func TestSetBrowserHeadersOnWire(t *testing.T) {
 
 func TestChromeMajor(t *testing.T) {
 	cases := map[string]string{
-		structure.DefaultUserAgent: "131",
+		structure.DefaultUserAgent:               "131",
 		"... Chrome/120.0.6099.71 Safari/537.36": "120",
 		"Mozilla/5.0 Firefox/124.0":              "",
 		"":                                       "",

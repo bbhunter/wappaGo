@@ -21,7 +21,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/EasyRecon/wappaGo/analyze"
-	"github.com/EasyRecon/wappaGo/lib"
 	"github.com/EasyRecon/wappaGo/report"
 	"github.com/EasyRecon/wappaGo/structure"
 	"github.com/EasyRecon/wappaGo/technologies"
@@ -33,7 +32,6 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/projectdiscovery/cdncheck"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
-	pdhttputil "github.com/projectdiscovery/httputil"
 	"github.com/remeh/sizedwaitgroup"
 )
 
@@ -43,17 +41,46 @@ type Cmd struct {
 	ResultGlobal map[string]interface{}
 	Cdn          *cdncheck.Client
 	Options      structure.Options
-	PortOpenByIP []structure.PortOpenByIp
-	portMu       sync.Mutex // guards PortOpenByIP
+	// portOpenByIP caches the open ports found for an IP so hosts sharing an
+	// address are scanned once. It replaces a []PortOpenByIp that was linearly
+	// scanned while holding portMu — quadratic, and fully serialised across
+	// every worker (4 s of lock time at 50k hosts).
+	portOpenByIP map[string][]string
+	portMu       sync.RWMutex // guards portOpenByIP
 	HttpClient   *http.Client
 	ResultArray  []structure.Data
 	reportMu     sync.Mutex // guards ResultArray (report mode)
 	throttle     *hostThrottle
 	Input        []string
+	// sigCtx is cancelled on SIGINT/SIGTERM. It gates the host loop and the
+	// port scanner so Ctrl+C actually stops the scan; previously it only
+	// parented the Chrome allocator, so the first Ctrl+C killed the browser and
+	// left the run grinding through the remaining input emitting empty results.
+	sigCtx context.Context
+}
+
+// interrupted reports whether a shutdown signal has been received.
+func (c *Cmd) interrupted() bool {
+	return c.sigCtx != nil && c.sigCtx.Err() != nil
 }
 
 func (c *Cmd) Start(results chan structure.Data) {
-	c.Dialer = c.InitDialer()
+	// Repair anything unset or nonsensical before a single pointer is
+	// dereferenced. Both entry points go through here, so neither the CLI nor
+	// the library can reach the scan with a nil field or an unbounded
+	// worker count.
+	c.Options.ApplyDefaults()
+	c.portOpenByIP = make(map[string][]string)
+
+	dialer, err := c.InitDialer()
+	if err != nil {
+		// Without a dialer every probe would nil-deref inside an http.Transport
+		// goroutine, where no recover() can reach it.
+		fmt.Fprintf(os.Stderr, "could not create the resolver cache: %v\n", err)
+		close(results)
+		return
+	}
+	c.Dialer = dialer
 	defer c.Dialer.Close()
 
 	// Build the HTTP client once, up front: it is read-only for the rest of
@@ -85,8 +112,31 @@ func (c *Cmd) Start(results chan structure.Data) {
 	// Tie the browser lifetime to SIGINT/SIGTERM: the first Ctrl+C cancels this
 	// context, which tears Chrome down and lets the deferred cleanup (browser
 	// processes, dialer, temp fingerprint dir) run instead of leaving orphans.
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// Watch for the signal on an explicit channel rather than via
+	// signal.NotifyContext: that helper's stop function cancels the context
+	// itself, so a normal end-of-scan teardown was indistinguishable from a real
+	// Ctrl+C and printed the interrupt notice on every single run.
+	sigCtx, cancelScan := context.WithCancel(context.Background())
+	defer cancelScan()
+	c.sigCtx = sigCtx
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	scanDone := make(chan struct{})
+	defer close(scanDone)
+	go func() {
+		select {
+		case <-sigCh:
+			fmt.Fprintln(os.Stderr, "\ninterrupted: finishing in-flight hosts, press Ctrl+C again to abort")
+			cancelScan()
+			// Restore the default handler so a second Ctrl+C kills the process.
+			// Previously the first signal disarmed it for the rest of the run,
+			// leaving no way to abort at all.
+			signal.Stop(sigCh)
+		case <-scanDone:
+		}
+	}()
 
 	//ctxAlloc, cancel := chromedp.NewExecAllocator(context.Background(), append(chromedp.DefaultExecAllocatorOptions[:], chromedp.Flag("headless", false), chromedp.Flag("disable-gpu", true))...)
 	ctxAlloc, cancel1 := chromedp.NewExecAllocator(sigCtx, optionsChromeCtx...)
@@ -113,6 +163,10 @@ func (c *Cmd) Start(results chan structure.Data) {
 	ip = ""
 	prog := newProgress(len(c.Input), *c.Options.NoProgress)
 	for _, line := range c.Input {
+		if c.interrupted() {
+			fmt.Fprintf(os.Stderr, "aborted: %d/%d hosts not scanned\n", len(c.Input)-int(prog.processed()), len(c.Input))
+			break
+		}
 		ip = ""
 		if *c.Options.AmassInput {
 			var result map[string]interface{}
@@ -172,7 +226,14 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 
 	if !*c.Options.AmassInput {
 		c.throttle.wait(url)
-		c.HttpClient.Get("http://" + url)
+		// This request exists only to populate the dialer history so
+		// GetDialedIP works. Its body was never read nor closed, which parked a
+		// connection plus its reader/writer goroutines until the 10 s client
+		// timeout reaped them — one leaked socket per host.
+		if warm, err := c.HttpClient.Get("http://" + url); err == nil {
+			io.Copy(io.Discard, io.LimitReader(warm.Body, 4096))
+			warm.Body.Close()
+		}
 		ip = c.Dialer.GetDialedIP(url)
 	}
 	isCDN, cdnName, _, err := c.Cdn.Check(net.ParseIP(ip))
@@ -188,11 +249,16 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 		CdnName = cdnName
 	}
 	var portOpen []string
-	c.portMu.Lock()
-	alreadyScanned := lib.CheckIpAlreadyScan(ip, c.PortOpenByIP)
-	c.portMu.Unlock()
-	if alreadyScanned.IP != "" {
-		portOpen = alreadyScanned.Open_port
+	// An empty IP means the address was never resolved; every such host would
+	// otherwise share one bogus cache entry and inherit another host's ports.
+	cached, hit := []string(nil), false
+	if ip != "" {
+		c.portMu.RLock()
+		cached, hit = c.portOpenByIP[ip]
+		c.portMu.RUnlock()
+	}
+	if hit {
+		portOpen = cached
 	} else {
 		// Each scanner goroutine reports its open port on a buffered channel
 		// instead of appending to a shared slice (which raced). The buffer is
@@ -212,9 +278,11 @@ func (c *Cmd) startPortScan(url string, ip string, results chan structure.Data) 
 		for p := range portChan {
 			portOpen = append(portOpen, p)
 		}
-		c.portMu.Lock()
-		c.PortOpenByIP = append(c.PortOpenByIP, structure.PortOpenByIp{IP: ip, Open_port: portOpen})
-		c.portMu.Unlock()
+		if ip != "" {
+			c.portMu.Lock()
+			c.portOpenByIP[ip] = portOpen
+			c.portMu.Unlock()
+		}
 	}
 	url = strings.TrimSpace(url)
 	for _, port := range portOpen {
@@ -294,7 +362,7 @@ func (c *Cmd) getWrapper(urlData string, port string, data structure.Data, resul
 func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, urlData string, port string, results chan structure.Data) {
 	var err error
 	if data.Infos.Location != "" {
-		urlData = data.Infos.Location
+		urlData = resolveLocation(urlData, data.Infos.Location)
 	}
 	dnsData, err := c.Dialer.GetDNSData(data.Infos.Data)
 	if dnsData != nil && err == nil {
@@ -309,28 +377,28 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 			//data, _ := network.GetResponseBody(ev.(*network.EventResponseReceived).RequestID).Do(cloneCTX)
 
 			//log.Println(string(data))
-			switch typeDoc := ev.(*network.EventResponseReceived).Type; typeDoc {
+			ev := ev.(*network.EventResponseReceived)
+			switch ev.Type {
 			case "XHR":
-				analyseStruct.AddXHRUrl(ev.(*network.EventResponseReceived).Response.URL)
-			case "Stylesheet":
-				//analyseStruct.CSSContent = append(analyseStruct.CSSContent,ev.(*network.EventResponseReceived).Response.URL)
-
-			case "Script":
-				//analyseStruct.CSSContent = append(analyseStruct.CSSContent,ev.(*network.EventResponseReceived).Response.URL)
+				analyseStruct.AddXHRUrl(ev.Response.URL)
+			case "Document":
+				// Headers of the page Chrome actually landed on. The raw probe
+				// stops at the 30x by default, so its headers describe the
+				// redirect, not the page that gets analysed — which is why a
+				// host redirecting http->https reported none of its header-based
+				// technologies (no Server, no X-Powered-By) even though the DOM
+				// ones came through.
+				analyseStruct.SetFinalHeaders(ev.Response.URL, ev.Response.Headers)
 			}
 		}
 		if _, ok := ev.(*page.EventJavascriptDialogOpening); ok {
-			//fmt.Println("closing alert:", ev.Message)
+			// Dismiss the dialog and say nothing else. This handler used to
+			// json.Marshal the shared result struct — racing the goroutine
+			// writing it — and print it to stdout, injecting a duplicate,
+			// half-filled record into the JSON stream.
 			go func() {
-				if err := chromedp.Run(cloneCTX,
-					page.HandleJavaScriptDialog(true),
-				); err != nil {
-					b, err := json.Marshal(data)
-					if err != nil {
-						fmt.Println("Error:", err)
-					}
-					fmt.Println(string(b))
-					return
+				if err := chromedp.Run(cloneCTX, page.HandleJavaScriptDialog(true)); err != nil {
+					fmt.Fprintf(os.Stderr, "dismiss dialog on %s: %v\n", urlData, err)
 				}
 			}()
 		}
@@ -376,9 +444,9 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 				var srcList []string
 				doc.Find("script").Each(func(i int, s *goquery.Selection) {
 					srcLink, exist := s.Attr("src")
-	
+
 					if exist {
-	
+
 						//fmt.Println(srcList, srcLink)
 						srcList = append(srcList, srcLink)
 					}
@@ -389,7 +457,10 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 
 			analyseStruct.ResultGlobal = c.ResultGlobal
 			analyseStruct.Resp = TempResp
-			
+			// The URL family matches against the page that was scanned, not
+			// against the Location header.
+			analyseStruct.Url = urlData
+
 			analyseStruct.Ctx = ctx
 			analyseStruct.Hote = data.Infos
 			analyseStruct.CookiesList = cookiesList
@@ -403,10 +474,20 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 		}),
 	)
 
+	// chromedp.Run's error used to be assigned and never read, so a failed
+	// navigation looked exactly like a page that rendered cleanly and happened
+	// to run no technologies. Record it and say so on stderr.
+	if err != nil {
+		data.Infos.Error = err.Error()
+		fmt.Fprintf(os.Stderr, "render %s: %v\n", urlData, err)
+	}
+
 	data.Infos.Technologies = technologies.DedupTechno(data.Infos.Technologies)
 	// Drop technologies whose "requires" precondition isn't met by the rest of
-	// the detected set (e.g. a plugin without the platform it needs).
+	// the detected set (e.g. a plugin without the platform it needs), then drop
+	// any that a detected technology declares it cannot coexist with.
 	data.Infos.Technologies = technologies.FilterRequired(data.Infos.Technologies, c.ResultGlobal)
+	data.Infos.Technologies = technologies.FilterExcluded(data.Infos.Technologies, c.ResultGlobal)
 	if *c.Options.Screenshot != "" && len(buf) > 0 {
 		// Name the screenshot by the SHA-1 of its URL. The previous scheme
 		// stripped ':' '/' '.' from the URL, which collapsed distinct URLs to
@@ -423,13 +504,44 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 			data.Infos.Screenshot = imgTitle + ".png"
 		}
 	}
+	// The HTML report is an additional sink, not a replacement for the JSON
+	// stream. -report used to take the else branch away entirely, so
+	// `wappaGo -report > out.json` wrote an empty file and the run looked like
+	// it had detected nothing.
 	if *c.Options.Report {
 		c.reportMu.Lock()
 		c.ResultArray = append(c.ResultArray, data)
 		c.reportMu.Unlock()
-	} else {
-		results <- data
 	}
+	results <- data
+}
+
+// resolveLocation resolves a redirect target against the URL that was actually
+// probed.
+//
+// A Location header is allowed to be relative (RFC 7231 §7.1.2) and very often
+// is — "https://stackoverflow.com" answers "302 Location: /questions". Feeding
+// that raw value to chromedp.Navigate fails, which aborted the whole action
+// chain, so Title, the screenshot and every technology matcher were skipped and
+// the host was emitted with an empty title and zero technologies.
+//
+// Anything that does not resolve to http(s) is refused and the probed URL is
+// kept: a scanned host must not be able to steer the operator's browser to
+// file:// or javascript:.
+func resolveLocation(probed string, location string) string {
+	base, err := URL.Parse(probed)
+	if err != nil {
+		return probed
+	}
+	ref, err := URL.Parse(strings.TrimSpace(location))
+	if err != nil {
+		return probed
+	}
+	target := base.ResolveReference(ref)
+	if target.Scheme != "http" && target.Scheme != "https" {
+		return probed
+	}
+	return target.String()
 }
 
 func (c *Cmd) scanPort(protocol, hostname string, port string, portTimeout int) bool {
@@ -486,95 +598,90 @@ func chromeMajor(ua string) string {
 	return rest[:j]
 }
 
+// maxProbeBody caps how much of a probed body is read. Only the metrics below
+// use it — technology detection runs on the DOM Chrome renders, not on this.
+const maxProbeBody = 4096
+
 // Do http request
 func Do(req *http.Request, client *http.Client) (*structure.Response, error) {
 	var gzipRetry bool
+	started := time.Now()
 get_response:
 	httpresp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
+	defer httpresp.Body.Close()
 
 	var resp structure.Response
 
+	// Response.Duration was read into Host.Response_time but never assigned, so
+	// every result reported response_time: 0 and the report's "time" row was
+	// always blank.
+	resp.Duration = time.Since(started)
 	resp.Headers = httpresp.Header.Clone()
 
-	// httputil.DumpResponse does not handle websockets
-	headers, rawResp, err := pdhttputil.DumpResponseHeadersAndRaw(httpresp)
-	if err != nil {
-		// Edge case - some servers respond with gzip encoding header but uncompressed body, in this case the standard library configures the reader as gzip, triggering an error when read.
-		// The bytes slice is not accessible because of abstraction, therefore we need to perform the request again tampering the Accept-Encoding header
-		if !gzipRetry && strings.Contains(err.Error(), "gzip: invalid header") {
-			gzipRetry = true
-			req.Header.Set("Accept-Encoding", "identity")
-			goto get_response
-		}
-
-		return nil, err
-
-	}
-	resp.Raw = string(rawResp)
-	resp.RawHeaders = string(headers)
+	// The previous implementation ran pdhttputil.DumpResponseHeadersAndRaw here,
+	// whose DumpResponse(resp, true) reads the ENTIRE body into memory and then
+	// copies it again — before the deliberate 4096-byte cap below ever applied.
+	// The size was dictated purely by the scanned host, so a large or
+	// heavily-compressed response could exhaust the scanner's memory. Its only
+	// outputs were Response.Raw and Response.RawHeaders, which nothing read.
 
 	var respbody []byte
 	// websockets don't have a readable body
 	if httpresp.StatusCode != http.StatusSwitchingProtocols {
-		var err error
-		respbody, err = io.ReadAll(io.LimitReader(httpresp.Body, 4096))
+		respbody, err = io.ReadAll(io.LimitReader(httpresp.Body, maxProbeBody))
 		if err != nil {
-
+			// Some servers advertise gzip but send an uncompressed body; the
+			// stdlib then wires up a gzip reader that fails on the first read.
+			// Retry once asking for identity.
+			if !gzipRetry && strings.Contains(err.Error(), "gzip: invalid header") {
+				gzipRetry = true
+				req.Header.Set("Accept-Encoding", "identity")
+				httpresp.Body.Close()
+				goto get_response
+			}
 			return nil, err
 		}
 	}
 
-	closeErr := httpresp.Body.Close()
-	if closeErr != nil {
-		return nil, closeErr
-	}
-
-	respbodystr := string(respbody)
-
-	// if content length is not defined
-	if resp.ContentLength <= 0 {
-		// check if it's in the header and convert to int
-		if contentLength, ok := resp.Headers["Content-Length"]; ok {
-			contentLengthInt, _ := strconv.Atoi(strings.Join(contentLength, ""))
-			resp.ContentLength = contentLengthInt
-		}
-
-		// if we have a body, then use the number of bytes in the body if the length is still zero
-		if resp.ContentLength <= 0 && len(respbodystr) > 0 {
-			resp.ContentLength = utf8.RuneCountInString(respbodystr)
-		}
-	}
-
-	resp.Data = respbody
-
-	// fill metrics
 	resp.StatusCode = httpresp.StatusCode
-	// number of words
-	resp.Words = len(strings.Split(respbodystr, " "))
-	// number of lines
-	resp.Lines = len(strings.Split(respbodystr, "\n"))
+
+	// Prefer the advertised length; fall back to what was actually read. The
+	// fallback is capped by maxProbeBody, so it under-reports on a large body
+	// that omits Content-Length.
+	if contentLength, ok := resp.Headers["Content-Length"]; ok {
+		if n, convErr := strconv.Atoi(strings.Join(contentLength, "")); convErr == nil && n >= 0 {
+			resp.ContentLength = n
+		}
+	}
+	if resp.ContentLength <= 0 && len(respbody) > 0 {
+		resp.ContentLength = utf8.RuneCountInString(string(respbody))
+	}
 
 	return &resp, nil
 }
 
-func (c *Cmd) InitDialer() *fastdialer.Dialer {
+// defaultResolvers are used when -resolvers is not set.
+const defaultResolvers = "8.8.8.8,1.1.1.1,64.6.64.6,74.82.42.42,1.0.0.1,8.8.4.4,64.6.65.6,77.88.8.8"
+
+// InitDialer builds the resolving dialer. It used to swallow the error and hand
+// back a nil *Dialer, which the caller then used as if it were valid.
+func (c *Cmd) InitDialer() (*fastdialer.Dialer, error) {
 	fastdialerOpts := fastdialer.DefaultOptions
 	fastdialerOpts.EnableFallback = true
 	fastdialerOpts.WithDialerHistory = true
 
-	if len(*c.Options.Resolvers) == 0 {
-		*c.Options.Resolvers = "8.8.8.8,1.1.1.1,64.6.64.6,74.82.42.42,1.0.0.1,8.8.4.4,64.6.65.6,77.88.8.8"
+	resolvers := *c.Options.Resolvers
+	if len(resolvers) == 0 {
+		// Do not write through the option pointer: it may alias a caller's
+		// struct field in library mode.
+		resolvers = defaultResolvers
 	}
-	fastdialerOpts.BaseResolvers = strings.Split(*c.Options.Resolvers, ",")
+	fastdialerOpts.BaseResolvers = strings.Split(resolvers, ",")
 
-	dialer, err := fastdialer.NewDialer(fastdialerOpts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "could not create resolver cache: %s\n", err)
-	}
-	return dialer
+	return fastdialer.NewDialer(fastdialerOpts)
 }
 
 // buildHTTPClient constructs the single, shared HTTP client used for every
