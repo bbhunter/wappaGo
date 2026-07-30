@@ -556,6 +556,61 @@ func TestBadFingerprintShapesDoNotPanic(t *testing.T) {
 	}
 }
 
+// TestDnsSOAMatchesNameserverAndMailbox pins the SOA mapping after
+// retryabledns changed DNSData.SOA from []string to a parsed struct. Every one
+// of the 43 SOA fingerprints in the live database targets a hostname — the
+// primary nameserver or the responsible mailbox — so both fields must be
+// matchable, and the numeric fields must not leak in as noise.
+func TestDnsSOAMatchesNameserverAndMailbox(t *testing.T) {
+	rg := map[string]interface{}{
+		"Cloudflare": map[string]interface{}{
+			"dns": map[string]interface{}{"SOA": `\.cloudflare\.com`},
+		},
+		"Sakura Internet": map[string]interface{}{
+			"dns": map[string]interface{}{"SOA": `tech\.sakura\.ad\.jp`},
+		},
+		// Must not match: 2026 appears only in the numeric serial, which is not
+		// part of the haystack.
+		"SerialNoise": map[string]interface{}{
+			"dns": map[string]interface{}{"SOA": `2026`},
+		},
+	}
+	a := Analyze{
+		ResultGlobal: rg,
+		Body:         "<html></html>",
+		DnsData: &retryabledns.DNSData{
+			SOA: []retryabledns.SOA{
+				{NS: "ns1.cloudflare.com", Mbox: "dns.cloudflare.com", Serial: 2026073001},
+				{NS: "ns1.dns.ne.jp", Mbox: "tech.sakura.ad.jp", Serial: 2026073002},
+			},
+		},
+	}
+
+	got := technologyVersions(technologies.DedupTechno(a.Run()))
+	for _, want := range []string{"Cloudflare", "Sakura Internet"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("%q not detected from the SOA record (got %v)", want, got)
+		}
+	}
+	if _, ok := got["SerialNoise"]; ok {
+		t.Error("a pattern matched the SOA serial: numeric fields must stay out of the haystack")
+	}
+}
+
+// TestDnsNilDataDoesNotPanic keeps the nil guard honest now that SOA goes
+// through a helper.
+func TestDnsNilDataDoesNotPanic(t *testing.T) {
+	a := Analyze{
+		ResultGlobal: map[string]interface{}{
+			"Whatever": map[string]interface{}{"dns": map[string]interface{}{"SOA": "x"}},
+		},
+		Body: "<html></html>",
+	}
+	if got := technologies.DedupTechno(a.Run()); len(got) != 0 {
+		t.Errorf("nil DnsData produced detections: %v", technologyNames(got))
+	}
+}
+
 // TestCompileCICachesAndToleratesBadPatterns documents the contract the
 // matchers rely on: valid patterns compile (and are cached), invalid RE2
 // patterns return ok=false instead of panicking.

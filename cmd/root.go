@@ -55,6 +55,9 @@ type Cmd struct {
 	// identity is the browser identity presented to every scanned host, read
 	// from the real Chrome build in Start before any worker starts.
 	identity identity
+	// dns answers the record queries the dns fingerprint family needs. Built
+	// once in Start and read-only afterwards.
+	dns *dnsResolver
 	// sigCtx is cancelled on SIGINT/SIGTERM. It gates the host loop and the
 	// port scanner so Ctrl+C actually stops the scan; previously it only
 	// parented the Chrome allocator, so the first Ctrl+C killed the browser and
@@ -85,6 +88,16 @@ func (c *Cmd) Start(results chan structure.Data) {
 	}
 	c.Dialer = dialer
 	defer c.Dialer.Close()
+
+	// Resolved explicitly rather than scavenged from the dialer's cache: newer
+	// fastdialer only retains address records, so the dns fingerprints had gone
+	// silent. A failure here is not fatal — the dns family is one signal source
+	// among a dozen — but it is worth reporting.
+	dnsResolver, dnsErr := newDNSResolver(c.resolvers())
+	if dnsErr != nil {
+		fmt.Fprintf(os.Stderr, "could not create the DNS resolver, dns fingerprints disabled: %v\n", dnsErr)
+	}
+	c.dns = dnsResolver
 
 	// Build the HTTP client once, up front: it is read-only for the rest of
 	// the run and shared across all target goroutines. Previously it was
@@ -375,8 +388,8 @@ func (c *Cmd) launchChrome(TempResp structure.Response, data structure.Data, url
 	if data.Infos.Location != "" {
 		urlData = resolveLocation(urlData, data.Infos.Location)
 	}
-	dnsData, err := c.Dialer.GetDNSData(data.Infos.Data)
-	if dnsData != nil && err == nil {
+	dnsData := c.dns.resolve(data.Infos.Data)
+	if dnsData != nil {
 		data.Infos.Cname = dnsData.CNAME
 	}
 	analyseStruct := analyze.Analyze{}
@@ -692,20 +705,25 @@ get_response:
 // defaultResolvers are used when -resolvers is not set.
 const defaultResolvers = "8.8.8.8,1.1.1.1,64.6.64.6,74.82.42.42,1.0.0.1,8.8.4.4,64.6.65.6,77.88.8.8"
 
+// resolvers returns the resolver list to use, honouring -resolvers.
+//
+// It does not write through the option pointer: in library mode that pointer may
+// alias a caller's struct field.
+func (c *Cmd) resolvers() []string {
+	list := defaultResolvers
+	if c.Options.Resolvers != nil && *c.Options.Resolvers != "" {
+		list = *c.Options.Resolvers
+	}
+	return strings.Split(list, ",")
+}
+
 // InitDialer builds the resolving dialer. It used to swallow the error and hand
 // back a nil *Dialer, which the caller then used as if it were valid.
 func (c *Cmd) InitDialer() (*fastdialer.Dialer, error) {
 	fastdialerOpts := fastdialer.DefaultOptions
 	fastdialerOpts.EnableFallback = true
 	fastdialerOpts.WithDialerHistory = true
-
-	resolvers := *c.Options.Resolvers
-	if len(resolvers) == 0 {
-		// Do not write through the option pointer: it may alias a caller's
-		// struct field in library mode.
-		resolvers = defaultResolvers
-	}
-	fastdialerOpts.BaseResolvers = strings.Split(resolvers, ",")
+	fastdialerOpts.BaseResolvers = c.resolvers()
 
 	return fastdialer.NewDialer(fastdialerOpts)
 }

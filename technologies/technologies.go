@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"dario.cat/mergo"
 	"github.com/EasyRecon/wappaGo/lib"
 	"github.com/EasyRecon/wappaGo/structure"
-	"github.com/imdario/mergo"
 )
 
 func CheckRequired(technoName string, technoList map[string]interface{}, tech []structure.Technologie) []structure.Technologie {

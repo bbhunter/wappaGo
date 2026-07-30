@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"github.com/EasyRecon/wappaGo/technologies"
+	"github.com/projectdiscovery/retryabledns"
 )
 
 func (a *Analyze) analyze_dns_main(technoName string, key string) {
@@ -26,7 +27,7 @@ func (a *Analyze) analyze_dns_main(technoName string, key string) {
 		case "TXT":
 			resultDNS = a.DnsData.TXT
 		case "SOA":
-			resultDNS = a.DnsData.SOA
+			resultDNS = soaStrings(a.DnsData.SOA)
 		case "NS":
 			resultDNS = a.DnsData.NS
 		case "CNAME":
@@ -42,6 +43,29 @@ func (a *Analyze) analyze_dns_main(technoName string, key string) {
 			}
 		}
 	}
+}
+
+// soaStrings flattens SOA records into the strings the fingerprints actually
+// match against.
+//
+// retryabledns used to hand back []string here and now returns a parsed struct,
+// so the fields have to be picked deliberately. All 43 SOA patterns in the
+// database target a hostname: either the primary nameserver
+// (`\.cloudflare\.com`, `\.domaincontrol\.com`, `\.vercel-dns\.com`) or the
+// responsible mailbox (`tech\.sakura\.ad\.jp`). The numeric serial/refresh/TTL
+// fields are never matched, so they are left out rather than concatenated into
+// noise a pattern could accidentally hit.
+func soaStrings(records []retryabledns.SOA) []string {
+	out := make([]string, 0, len(records)*2)
+	for _, r := range records {
+		if r.NS != "" {
+			out = append(out, r.NS)
+		}
+		if r.Mbox != "" {
+			out = append(out, r.Mbox)
+		}
+	}
+	return out
 }
 
 func (a *Analyze) analyze_dns_regex(regex string, resultsDNS []string) bool {
